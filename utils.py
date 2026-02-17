@@ -313,7 +313,12 @@ class SampleQueue:
             self.indices[c] += 1
             self.counts[c] = min(self.counts[c] + 1, self.queue_size)
 
-    def sample(self, label: int, n: int, device: torch.device) -> torch.Tensor:
+    def sample(
+        self,
+        label: int,
+        n: int,
+        device: torch.device,
+    ) -> torch.Tensor:
         """
         Sample n examples from the queue for a given class.
 
@@ -328,14 +333,58 @@ class SampleQueue:
         count = self.counts[label]
         if count == 0:
             raise ValueError(f"No samples in queue for class {label}")
-
-        indices = torch.randint(0, count, (n,))
+        if n > count:
+            raise ValueError(
+                f"Cannot sample {n} items without replacement from class {label} "
+                f"queue with only {count} cached samples."
+            )
+        indices = torch.randperm(count)[:n]
         samples = self.queues[label][indices]
         return samples.to(device)
 
     def is_ready(self, min_samples: int = 32) -> bool:
         """Check if all queues have at least min_samples."""
         return all(self.counts[c] >= min_samples for c in range(self.num_classes))
+
+
+class GlobalSampleQueue:
+    """Queue of unlabeled samples for unconditional negatives in CFG training."""
+
+    def __init__(
+        self,
+        queue_size: int = 1000,
+        sample_shape: tuple = (3, 256, 256),
+    ):
+        self.queue_size = queue_size
+        self.samples = torch.zeros(queue_size, *sample_shape)
+        self.count = 0
+        self.index = 0
+
+    def add(self, samples: torch.Tensor):
+        samples = samples.detach().cpu()
+        for sample in samples:
+            idx = self.index % self.queue_size
+            self.samples[idx] = sample
+            self.index += 1
+            self.count = min(self.count + 1, self.queue_size)
+
+    def sample(
+        self,
+        n: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self.count == 0:
+            raise ValueError("No samples in global queue")
+        if n > self.count:
+            raise ValueError(
+                f"Cannot sample {n} unconditional items without replacement from "
+                f"global queue with only {self.count} cached samples."
+            )
+        indices = torch.randperm(self.count)[:n]
+        return self.samples[indices].to(device)
+
+    def is_ready(self, min_samples: int = 32) -> bool:
+        return self.count >= min_samples
 
 
 def count_parameters(model: nn.Module) -> int:

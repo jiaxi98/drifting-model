@@ -1,98 +1,115 @@
 """
-Training script for Drifting Models on MNIST and CIFAR-10.
-Implements Algorithm 1 from the paper with class-conditional generation.
+Training script for Drifting Models on MNIST/CIFAR-10/ImageNet.
+Includes a minimal ImageNet pipeline with CFG-aware drifting loss.
 """
 
 import argparse
+import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
+import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torchmetrics.image.fid import FrechetInceptionDistance
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
-from model import DriftDiT_Tiny, DriftDiT_Small, DriftDiT_models
-from drifting import (
-    compute_V,
-    normalize_features,
-    normalize_drift,
-)
-from feature_encoder import create_feature_encoder, pretrain_mae
+from drifting import compute_V
+from feature_encoder import create_feature_encoder, extract_feature_sets
+from model import DriftDiT_models
+from sample import compute_fid_score, generate_class_grid
 from utils import (
     EMA,
-    WarmupLRScheduler,
+    GlobalSampleQueue,
     SampleQueue,
-    save_checkpoint,
-    load_checkpoint,
-    save_image_grid,
+    WarmupLRScheduler,
     count_parameters,
+    load_checkpoint,
+    save_checkpoint,
+    save_image_grid,
     set_seed,
 )
 
 
-# Default hyperparameters
-MNIST_CONFIG = {
-    "model": "DriftDiT-Tiny",
-    "img_size": 32,
-    "in_channels": 1,
-    "num_classes": 10,
-    "batch_nc": 10,  # Number of classes per batch
-    "batch_n_pos": 32,  # Positive samples per class
-    "batch_n_neg": 32,  # Negative samples per class
-    "temperatures": [0.02, 0.05, 0.2],
-    "lr": 2e-4,
-    "weight_decay": 0.01,
-    "grad_clip": 2.0,
-    "ema_decay": 0.999,
-    "warmup_steps": 1000,
-    "epochs": 100,
-    "alpha_min": 1.0,
-    "alpha_max": 3.0,
-    "use_feature_encoder": False,  # Pixel space for MNIST
-    "queue_size": 128,
-    "label_dropout": 0.1,
-}
-
-CIFAR10_CONFIG = {
-    "model": "DriftDiT-Small",
-    "img_size": 32,
-    "in_channels": 3,
-    "num_classes": 10,
-    "batch_nc": 10,
-    "batch_n_pos": 32,
-    "batch_n_neg": 32,
-    "temperatures": [0.02, 0.05, 0.2],
-    "lr": 2e-4,
-    "weight_decay": 0.01,
-    "grad_clip": 2.0,
-    "ema_decay": 0.999,
-    "warmup_steps": 2000,
-    "epochs": 200,
-    "alpha_min": 1.0,
-    "alpha_max": 3.0,
-    "use_feature_encoder": True,  # Use pretrained ResNet for feature space
-    "queue_size": 128,
-    "label_dropout": 0.1,
+DATASET_CONFIG_FILES = {
+    "mnist": "config/datasets/mnist.yaml",
+    "cifar": "config/datasets/cifar.yaml",
+    "imagenet": "config/datasets/imagenet.yaml",
 }
 
 
-def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> tuple:
-    """Get dataset and transforms."""
-    if name.lower() == "mnist":
-        # MNIST data is at {root}/mnist/MNIST/raw/
+def setup_distributed() -> Tuple[bool, int, int, int]:
+    """Initialize DDP if launched with torchrun."""
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return False, 0, 1, 0
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed training requires CUDA.")
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return True, rank, world_size, local_rank
+
+
+def cleanup_distributed(distributed: bool):
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def get_default_config(dataset: str) -> Dict[str, Any]:
+    name = dataset.lower()
+    rel_path = DATASET_CONFIG_FILES.get(name)
+    if rel_path is None:
+        raise ValueError(f"Unsupported dataset: {dataset}")
+    config_path = Path(rel_path)
+    if not config_path.is_absolute():
+        config_path = Path(__file__).resolve().parent / config_path
+    config_path = config_path.expanduser()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Missing {name} dataset config: {config_path}")
+    with config_path.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"{name} dataset config must contain a mapping: {config_path}")
+    return config.copy()
+
+
+def get_dataset(
+    name: str,
+    root: str,
+    img_size: int,
+    include_eval: bool = True,
+):
+    """Create dataset objects for train/eval."""
+    name = name.lower()
+    if name == "mnist":
         mnist_root = os.path.join(root, "mnist")
         transform = transforms.Compose([
-            transforms.Resize(32),
+            transforms.Resize(img_size),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),  # [-1, 1]
+            transforms.Normalize([0.5], [0.5]),
         ])
-        train_dataset = datasets.MNIST(mnist_root, train=True, download=False, transform=transform)
-        test_dataset = datasets.MNIST(mnist_root, train=False, download=False, transform=transform)
-    elif name.lower() in ["cifar10", "cifar"]:
+        train_dataset = datasets.MNIST(mnist_root, train=True, download=True, transform=transform)
+        test_dataset = (
+            datasets.MNIST(mnist_root, train=False, download=True, transform=transform)
+            if include_eval
+            else None
+        )
+        return train_dataset, test_dataset
+
+    if name == "cifar":
         transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
@@ -103,272 +120,400 @@ def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> 
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
         train_dataset = datasets.CIFAR10(root, train=True, download=True, transform=transform)
-        test_dataset = datasets.CIFAR10(root, train=False, download=True, transform=test_transform)
-    else:
-        raise ValueError(f"Unknown dataset: {name}")
+        test_dataset = (
+            datasets.CIFAR10(root, train=False, download=True, transform=test_transform)
+            if include_eval
+            else None
+        )
+        return train_dataset, test_dataset
 
-    return train_dataset, test_dataset
+    if name == "imagenet":
+        train_dir = Path(root) / "train"
+        val_dir = Path(root) / "val"
+        if not train_dir.exists():
+            raise FileNotFoundError(
+                f"ImageNet expects {train_dir}. Prepare ImageFolder-style train directory first."
+            )
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+        val_transform = transforms.Compose([
+            transforms.Resize(int(img_size * 256 / 224)),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+        train_dataset = datasets.ImageFolder(str(train_dir), transform=train_transform)
+        if include_eval:
+            has_val_classes = val_dir.exists() and any(p.is_dir() for p in val_dir.iterdir())
+            if has_val_classes:
+                test_dataset = datasets.ImageFolder(str(val_dir), transform=val_transform)
+            else:
+                test_dataset = train_dataset
+        else:
+            test_dataset = None
+        return train_dataset, test_dataset
+
+    raise ValueError(f"Unsupported dataset: {name}")
 
 
-def sample_batch(
-    queue: SampleQueue,
-    num_classes: int,
-    n_pos: int,
+def sample_alpha(
+    n: int,
+    alpha_min: float,
+    alpha_max: float,
+    mode: str,
+    power: float,
     device: torch.device,
-) -> tuple:
-    """Sample a batch of positive samples from the queue."""
-    x_pos_list = []
-    labels_list = []
+) -> torch.Tensor:
+    """Sample alpha values from configured distribution."""
+    if mode == "uniform":
+        return torch.empty(n, device=device).uniform_(alpha_min, alpha_max)
 
-    for c in range(num_classes):
-        x_c = queue.sample(c, n_pos, device)
-        x_pos_list.append(x_c)
-        labels_list.append(torch.full((n_pos,), c, device=device, dtype=torch.long))
+    if mode == "power":
+        u = torch.rand(n, device=device)
+        if abs(power - 1.0) < 1e-6:
+            amin = math.log(alpha_min)
+            amax = math.log(alpha_max)
+            return torch.exp(amin + u * (amax - amin))
+        expo = 1.0 - power
+        amin = alpha_min ** expo
+        amax = alpha_max ** expo
+        return (amin + u * (amax - amin)).pow(1.0 / expo)
 
-    x_pos = torch.cat(x_pos_list, dim=0)
-    labels = torch.cat(labels_list, dim=0)
+    if mode == "mixed":
+        alpha = sample_alpha(n, alpha_min, alpha_max, "power", power, device)
+        choose_one = torch.rand(n, device=device) < 0.5
+        alpha[choose_one] = 1.0
+        return alpha
 
-    return x_pos, labels
+    raise ValueError(f"Unsupported alpha sampling mode: {mode}")
+
+
+def alpha_to_uncond_weight(alpha: torch.Tensor, n_neg: int, n_uncond: int) -> torch.Tensor:
+    """Compute uncond negative weight w from CFG alpha."""
+    if n_uncond <= 0:
+        return torch.zeros_like(alpha)
+    denom = max(n_neg - 1, 1)
+    return ((alpha - 1.0) * denom / n_uncond).clamp(min=0.0)
 
 
 def compute_drifting_loss(
     x_gen: torch.Tensor,
     labels_gen: torch.Tensor,
+    class_labels: torch.Tensor,
+    class_alphas: torch.Tensor,
     x_pos: torch.Tensor,
     labels_pos: torch.Tensor,
+    x_uncond: Optional[torch.Tensor],
     feature_encoder: Optional[nn.Module],
-    temperatures: list,
-    use_pixel_space: bool = False,
-) -> tuple:
-    """
-    Compute class-conditional drifting loss with multi-scale features.
-
-    Following paper Section A.5: compute drifting loss at each scale, then sum.
-
-    Args:
-        x_gen: Generated samples (B, C, H, W)
-        labels_gen: Labels for generated samples (B,)
-        x_pos: Positive (real) samples (B_pos, C, H, W)
-        labels_pos: Labels for positive samples (B_pos,)
-        feature_encoder: Feature encoder (returns List[Tensor] for multi-scale)
-        temperatures: List of temperatures for V computation
-        use_pixel_space: Whether to use pixel space directly
-
-    Returns:
-        loss: Scalar loss
-        info: Dict with metrics
-    """
+    vae_decoder: Optional[nn.Module],
+    temperatures: List[float],
+    n_neg: int,
+    n_uncond: int,
+    use_pixel_space: bool,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """CFG-aware drifting loss (minimal implementation)."""
     device = x_gen.device
-    num_classes = labels_gen.max().item() + 1
 
-    # Extract features
-    if use_pixel_space or feature_encoder is None:
-        # Pixel space: single scale
-        feat_gen_list = [x_gen.flatten(start_dim=1)]
-        feat_pos_list = [x_pos.flatten(start_dim=1)]
-    else:
-        # Multi-scale feature maps from pretrained encoder
-        feat_gen_maps = feature_encoder(x_gen)  # List of (B, C, H, W)
-        with torch.no_grad():
-            feat_pos_maps = feature_encoder(x_pos)
+    feat_gen_list = extract_feature_sets(x_gen, feature_encoder, vae_decoder, use_pixel_space)
+    feat_pos_list = extract_feature_sets(x_pos, feature_encoder, vae_decoder, use_pixel_space)
+    feat_uncond_list = (
+        extract_feature_sets(x_uncond, feature_encoder, vae_decoder, use_pixel_space)
+        if x_uncond is not None
+        else []
+    )
 
-        # Global average pool each scale to get vectors
-        feat_gen_list = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat_gen_maps]
-        feat_pos_list = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat_pos_maps]
+    total_loss = torch.tensor(0.0, device=device)
+    Z_pos = 0.0
+    Z_neg = 0.0
+    n_terms = 0
 
-    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-    total_drift_norm = 0.0
-    num_losses = 0
-
-    # Compute loss per class
-    for c in range(num_classes):
-        mask_gen = labels_gen == c
-        mask_pos = labels_pos == c
-
+    for class_idx, class_id in enumerate(class_labels.tolist()):
+        alpha_c = class_alphas[class_idx]
+        uncond_w = alpha_to_uncond_weight(alpha_c.unsqueeze(0), n_neg=n_neg, n_uncond=n_uncond)[0]
+        mask_gen = labels_gen == class_id
+        mask_pos = labels_pos == class_id
         if not mask_gen.any() or not mask_pos.any():
             continue
 
-        # Compute loss at each scale
-        for scale_idx, (feat_gen, feat_pos) in enumerate(zip(feat_gen_list, feat_pos_list)):
+        for feature_idx, (feat_gen, feat_pos) in enumerate(zip(feat_gen_list, feat_pos_list)):
             feat_gen_c = feat_gen[mask_gen]
             feat_pos_c = feat_pos[mask_pos]
+            if feat_gen_c.shape[0] == 0 or feat_pos_c.shape[0] == 0:
+                continue
 
-            # Negatives: generated samples from current class (following Algorithm 1: y_neg = x)
-            feat_neg_c = feat_gen_c
+            if len(feat_uncond_list) > 0:
+                feat_uncond = feat_uncond_list[feature_idx]
+                feat_neg = torch.cat([feat_gen_c, feat_uncond], dim=0)
+                neg_weights = torch.cat([
+                    torch.ones(feat_gen_c.shape[0], device=device),
+                    torch.full((feat_uncond.shape[0],), uncond_w.item(), device=device),
+                ], dim=0)
+            else:
+                feat_neg = feat_gen_c
+                neg_weights = None
 
-            # Simple L2 normalization (projects to unit sphere)
-            feat_gen_c_norm = F.normalize(feat_gen_c, p=2, dim=1)
-            feat_pos_c_norm = F.normalize(feat_pos_c, p=2, dim=1)
-            feat_neg_c_norm = F.normalize(feat_neg_c, p=2, dim=1)
+            feat_gen_n = F.normalize(feat_gen_c, p=2, dim=1)
+            feat_pos_n = F.normalize(feat_pos_c, p=2, dim=1)
+            feat_neg_n = F.normalize(feat_neg, p=2, dim=1)
 
-            # Compute V with multiple temperatures
-            V_total = torch.zeros_like(feat_gen_c_norm)
+            v_total = torch.zeros_like(feat_gen_n)
             for tau in temperatures:
-                V_tau = compute_V(
-                    feat_gen_c_norm,
-                    feat_pos_c_norm,
-                    feat_neg_c_norm,
-                    tau,
-                    mask_self=True,  # y_neg = x, so mask self
+                v_tau, a_pos, a_neg = compute_V(
+                    feat_gen_n,
+                    feat_pos_n,
+                    feat_neg_n,
+                    temperature=tau,
+                    mask_self=True,
+                    neg_weights=neg_weights,
                 )
-                # Normalize each V before summing
-                v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
-                V_tau = V_tau / (v_norm + 1e-8)
-                V_total = V_total + V_tau
+                Z_pos += float(torch.mean(torch.sum(a_pos, dim=-1)).item())
+                Z_neg += float(torch.mean(torch.sum(a_neg, dim=-1)).item())
+                v_tau = v_tau / torch.sqrt(torch.mean(v_tau**2)).detach()
+                v_total = v_total + v_tau
 
-            # Loss: MSE(phi(x), stopgrad(phi(x) + V))
-            target = (feat_gen_c_norm + V_total).detach()
-            loss_scale = F.mse_loss(feat_gen_c_norm, target)
+            target = (feat_gen_n + v_total).detach()
+            # NOTE: loss term is consistent with normalization of v_tau
+            loss_term = F.mse_loss(feat_gen_n, target)
+            total_loss = total_loss + loss_term
+            n_terms += 1
 
-            total_loss = total_loss + loss_scale
-            total_drift_norm += (V_total ** 2).mean().item() ** 0.5
-            num_losses += 1
+    if n_terms == 0:
+        # Keep graph valid for backward while avoiding divide-by-zero.
+        zero_loss = x_gen.sum() * 0.0
+        return zero_loss, {"loss": 0.0, "Z_pos": 0.0, "Z_neg": 0.0}
 
-    if num_losses == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), {"loss": 0.0, "drift_norm": 0.0}
-
-    loss = total_loss / num_losses
+    loss = total_loss / n_terms
     info = {
-        "loss": loss.item(),
-        "drift_norm": total_drift_norm / num_losses,
+        "loss": float(loss.item()),
+        "Z_pos": Z_pos / n_terms,
+        "Z_neg": Z_neg / n_terms,
     }
-
     return loss, info
 
 
 def train_step(
+    model_for_train: nn.Module,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    queue: SampleQueue,
-    config: dict,
+    scheduler: WarmupLRScheduler,
+    scaler: torch.cuda.amp.GradScaler,
+    ema: EMA,
+    class_queue: SampleQueue,
+    uncond_queue: Optional[GlobalSampleQueue],
+    config: Dict[str, Any],
     device: torch.device,
-    feature_encoder: Optional[nn.Module] = None,
-) -> dict:
-    """
-    Single training step (Algorithm 1).
+    feature_encoder: Optional[nn.Module],
+    vae_decoder: Optional[nn.Module] = None,
+) -> Optional[Dict[str, float]]:
+    """Run one optimization step. Returns None if queues are not ready."""
+    if not class_queue.is_ready(config["batch_n_pos"]):
+        return None
+    if uncond_queue is not None and not uncond_queue.is_ready(config["batch_n_uncond"]):
+        return None
 
-    1. Sample class labels and CFG alpha
-    2. Generate samples from noise
-    3. Sample positive samples from queue
-    4. Compute drifting field and loss
-    5. Update model
-    """
-    model.train()
-    num_classes = config["num_classes"]
+    model_for_train.train()
+    batch_nc = config["batch_nc"]
     n_pos = config["batch_n_pos"]
     n_neg = config["batch_n_neg"]
-    alpha_min = config["alpha_min"]
-    alpha_max = config["alpha_max"]
-    temperatures = config["temperatures"]
-    use_pixel = not config["use_feature_encoder"]
+    n_uncond = config["batch_n_uncond"]
 
-    # Total batch size
-    batch_size = num_classes * n_neg
+    if batch_nc <= config["num_classes"]:
+        class_labels = torch.randperm(config["num_classes"], device=device)[:batch_nc]
+    else:
+        class_labels = torch.randint(0, config["num_classes"], (batch_nc,), device=device)
+    class_alphas = sample_alpha(
+        batch_nc,
+        alpha_min=config["alpha_min"],
+        alpha_max=config["alpha_max"],
+        mode=config["alpha_sampling"],
+        power=config["alpha_power"],
+        device=device,
+    )
+    labels_gen = class_labels.repeat_interleave(n_neg)
+    alpha_gen = class_alphas.repeat_interleave(n_neg)
+    x_pos_list = []
+    y_pos_list = []
+    for c in class_labels.tolist():
+        x_c = class_queue.sample(c, n_pos, device=device)
+        y_c = torch.full((n_pos,), c, device=device, dtype=torch.long)
+        x_pos_list.append(x_c)
+        y_pos_list.append(y_c)
+    x_pos = torch.cat(x_pos_list, dim=0)
+    labels_pos = torch.cat(y_pos_list, dim=0)
+    x_uncond = (
+        uncond_queue.sample(n_uncond, device=device)
+        if n_uncond > 0 and uncond_queue is not None
+        else None
+    )
 
-    # Sample class labels (repeat each class n_neg times)
-    labels = torch.arange(num_classes, device=device).repeat_interleave(n_neg)
-
-    # Sample CFG alpha ~ Uniform(alpha_min, alpha_max)
-    alpha = torch.empty(batch_size, device=device).uniform_(alpha_min, alpha_max)
-
-    # Sample noise
     noise = torch.randn(
-        batch_size,
+        labels_gen.shape[0],
         config["in_channels"],
         config["img_size"],
         config["img_size"],
         device=device,
     )
 
-    # Generate samples
-    x_gen = model(noise, labels, alpha)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+        x_gen = model_for_train(noise, labels_gen, alpha_gen)
+        loss, info = compute_drifting_loss(
+            x_gen=x_gen,
+            labels_gen=labels_gen,
+            class_labels=class_labels,
+            class_alphas=class_alphas,
+            x_pos=x_pos,
+            labels_pos=labels_pos,
+            x_uncond=x_uncond,
+            feature_encoder=feature_encoder,
+            vae_decoder=vae_decoder,
+            temperatures=config["temperatures"],
+            n_neg=n_neg,
+            n_uncond=n_uncond,
+            use_pixel_space=not config["use_feature_encoder"],
+        )
 
-    # Sample positive samples from queue
-    x_pos, labels_pos = sample_batch(queue, num_classes, n_pos, device)
+    if scaler.is_enabled():
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+        optimizer.step()
 
-    # Compute drifting loss
-    loss, info = compute_drifting_loss(
-        x_gen,
-        labels,
-        x_pos,
-        labels_pos,
-        feature_encoder,
-        temperatures,
-        use_pixel_space=use_pixel,
-    )
+    info["grad_norm"] = float(grad_norm.item())
+    # Alpha diagnostics for sampled class-level CFG strengths.
+    info["alpha_mean"] = float(class_alphas.mean().item())
+    info["alpha_std"] = float(class_alphas.std(unbiased=False).item())
+    info["alpha_min"] = float(class_alphas.min().item())
+    info["alpha_max"] = float(class_alphas.max().item())
 
-    # Backward pass
-    optimizer.zero_grad()
-    loss.backward()
-
-    # Gradient clipping
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(), config["grad_clip"]
-    )
-    info["grad_norm"] = grad_norm.item()
-
-    # Optimizer step
-    optimizer.step()
-
+    ema.update(model)
+    scheduler.step()
     return info
 
 
-def fill_queue(
-    queue: SampleQueue,
+def fill_queues(
+    class_queue: SampleQueue,
+    uncond_queue: Optional[GlobalSampleQueue],
     dataloader: DataLoader,
-    device: torch.device,
-    min_samples: int = 64,
+    min_class_samples: int,
+    min_uncond_samples: int = 0,
 ):
-    """Fill the sample queue with real data."""
+    """Warm up sample queues with real data."""
     for batch in dataloader:
         if isinstance(batch, (list, tuple)):
             x, labels = batch[0], batch[1]
         else:
-            x, labels = batch, torch.zeros(batch.shape[0], dtype=torch.long)
+            x = batch
+            labels = torch.zeros(x.shape[0], dtype=torch.long)
+        class_queue.add(x, labels)
+        if uncond_queue is not None:
+            uncond_queue.add(x)
 
-        queue.add(x, labels)
-
-        if queue.is_ready(min_samples):
+        class_ready = class_queue.is_ready(min_class_samples)
+        uncond_ready = uncond_queue is None or uncond_queue.is_ready(min_uncond_samples)
+        if class_ready and uncond_ready:
             break
 
 
-def train(
-    dataset: str = "mnist",
-    output_dir: str = "./outputs",
-    resume: Optional[str] = None,
-    seed: int = 42,
-    num_workers: int = 4,
-    log_interval: int = 100,
-    save_interval: int = 10,
-    sample_interval: int = 10,
-):
-    """Main training function."""
-    set_seed(seed)
+def reduce_info(info: Dict[str, float], device: torch.device, distributed: bool, world_size: int):
+    if not distributed:
+        return info
+    keys = sorted(info.keys())
+    vec = torch.tensor([float(info[k]) for k in keys], dtype=torch.float32, device=device)
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    vec = vec / world_size
+    return {k: vec[i].item() for i, k in enumerate(keys)}
 
-    # Get config
-    config = MNIST_CONFIG.copy() if dataset.lower() == "mnist" else CIFAR10_CONFIG.copy()
-    config["dataset"] = dataset
+def maybe_init_wandb(args, config: Dict[str, Any], is_main: bool):
+    if not args.wandb or not is_main:
+        return None
+    key_file = Path(args.wandb_key_file) if args.wandb_key_file else None
+    if key_file and key_file.exists() and "WANDB_API_KEY" not in os.environ:
+        os.environ["WANDB_API_KEY"] = key_file.read_text().strip()
 
-    # Setup device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    run = wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config=config,
+    )
+    return run
 
-    # Create output directory
-    output_dir = Path(output_dir) / dataset
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load dataset
-    train_dataset, test_dataset = get_dataset(dataset)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=256,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
+def train(args):
+    distributed, rank, world_size, local_rank = setup_distributed()
+    is_main = rank == 0
+    device = (
+        torch.device(f"cuda:{local_rank}")
+        if torch.cuda.is_available()
+        else torch.device("cpu")
     )
 
-    # Create model
+    seed = args.seed + rank
+    set_seed(seed)
+
+    config = get_default_config(args.dataset)
+    config["dataset"] = args.dataset.lower()
+
+    # Ensure queues can satisfy per-step sampling requirements.
+    if config["queue_size"] < config["batch_n_pos"]:
+        config["queue_size"] = config["batch_n_pos"]
+    if config["batch_n_uncond"] > 0 and config["uncond_queue_size"] < config["batch_n_uncond"]:
+        config["uncond_queue_size"] = config["batch_n_uncond"]
+    if is_main:
+        print(f"Using device: {device}")
+        print(f"Dataset: {config['dataset']}")
+        print(f"Distributed: {distributed} (world_size={world_size})")
+
+    output_dir = Path(args.output_dir) / config["dataset"]
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    need_eval_dataset = is_main and args.wandb and args.wandb_fid_interval > 0
+    train_dataset, test_dataset = get_dataset(
+        config["dataset"],
+        root=args.data_root,
+        img_size=config["img_size"],
+        include_eval=need_eval_dataset,
+    )
+
+    dataset_num_classes = len(getattr(train_dataset, "classes", []))
+    if dataset_num_classes > 0 and dataset_num_classes != config["num_classes"]:
+        if is_main:
+            print(
+                f"Detected {dataset_num_classes} classes from dataset, overriding "
+                f"config num_classes={config['num_classes']} for this run."
+            )
+        config["num_classes"] = dataset_num_classes
+
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["loader_batch_size"],
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+    )
+
     model_fn = DriftDiT_models[config["model"]]
     model = model_fn(
         img_size=config["img_size"],
@@ -376,145 +521,233 @@ def train(
         num_classes=config["num_classes"],
         label_dropout=config["label_dropout"],
     ).to(device)
+    model_for_train: nn.Module = model
+    if distributed:
+        model_for_train = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    print(f"Model: {config['model']}, Parameters: {count_parameters(model):,}")
+    if is_main:
+        print(f"Model: {config['model']}, Parameters: {count_parameters(model):,}")
 
-    # Create EMA
+    feature_encoder = None
+    if config["use_feature_encoder"]:
+        if is_main:
+            print("Creating feature encoder...")
+        feature_encoder = create_feature_encoder(
+            dataset=config["dataset"],
+            feature_dim=512,
+            multi_scale=True,
+            use_pretrained=True,
+            pretrained_arch=config["feature_encoder_arch"],
+        ).to(device)
+        feature_encoder.eval()
+        for p in feature_encoder.parameters():
+            p.requires_grad = False
+
     ema = EMA(model, decay=config["ema_decay"])
-
-    # Create optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["lr"],
         betas=(0.9, 0.95),
         weight_decay=config["weight_decay"],
     )
-
-    # Create scheduler
-    steps_per_epoch = len(train_loader)
     scheduler = WarmupLRScheduler(
         optimizer,
         warmup_steps=config["warmup_steps"],
         base_lr=config["lr"],
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and torch.cuda.is_available())
 
-    # Create sample queue
-    queue = SampleQueue(
+    class_queue = SampleQueue(
         num_classes=config["num_classes"],
         queue_size=config["queue_size"],
         sample_shape=(config["in_channels"], config["img_size"], config["img_size"]),
     )
-
-    # Feature encoder (for CIFAR)
-    feature_encoder = None
-    if config["use_feature_encoder"]:
-        print("Creating feature encoder...")
-        feature_encoder = create_feature_encoder(
-            dataset=dataset,
-            feature_dim=512,
-            multi_scale=True,
-            use_pretrained=True,  # Use ImageNet-pretrained ResNet
-        ).to(device)
-
-        # For pretrained ResNet, no need for MAE pre-training
-        # The ImageNet features work well for natural images
-        print("Using ImageNet-pretrained ResNet encoder")
-
-        feature_encoder.eval()
-        for param in feature_encoder.parameters():
-            param.requires_grad = False
-
-    # Resume from checkpoint
-    start_epoch = 0
-    global_step = 0
-    if resume:
-        checkpoint = load_checkpoint(resume, model, ema, optimizer, scheduler)
-        start_epoch = checkpoint["epoch"] + 1
-        global_step = checkpoint["step"]
-        print(f"Resumed from epoch {start_epoch}, step {global_step}")
-
-    # Training loop
-    print(f"\nStarting training for {config['epochs']} epochs...")
-    for epoch in range(start_epoch, config["epochs"]):
-        epoch_start = time.time()
-        epoch_loss = 0.0
-        epoch_drift_norm = 0.0
-        num_batches = 0
-
-        # Fill queue at start of each epoch
-        fill_queue(queue, train_loader, device, min_samples=64)
-
-        for batch_idx, batch in enumerate(train_loader):
-            if isinstance(batch, (list, tuple)):
-                x_real, labels_real = batch[0].to(device), batch[1].to(device)
-            else:
-                x_real = batch.to(device)
-                labels_real = torch.zeros(x_real.shape[0], dtype=torch.long, device=device)
-
-            # Add to queue
-            queue.add(x_real.cpu(), labels_real.cpu())
-
-            # Skip if queue not ready
-            if not queue.is_ready(config["batch_n_pos"]):
-                continue
-
-            # Training step
-            info = train_step(
-                model,
-                optimizer,
-                queue,
-                config,
-                device,
-                feature_encoder,
-            )
-
-            # Update EMA and scheduler
-            ema.update(model)
-            scheduler.step()
-
-            # Accumulate metrics
-            epoch_loss += info["loss"]
-            epoch_drift_norm += info["drift_norm"]
-            num_batches += 1
-            global_step += 1
-
-            # Logging
-            if global_step % log_interval == 0:
-                lr = scheduler.get_lr()
-                print(
-                    f"Epoch {epoch+1}/{config['epochs']} | "
-                    f"Step {global_step} | "
-                    f"Loss: {info['loss']:.4f} | "
-                    f"Drift: {info['drift_norm']:.4f} | "
-                    f"Grad: {info['grad_norm']:.4f} | "
-                    f"LR: {lr:.6f}"
-                )
-
-            # Generate samples every 500 steps for quick visualization
-            if global_step % 500 == 0:
-                sample_path = output_dir / f"samples_step{global_step}.png"
-                generate_samples(
-                    ema.shadow,
-                    config,
-                    device,
-                    str(sample_path),
-                    num_per_class=8,
-                )
-                print(f"Saved samples to {sample_path}")
-
-        # Epoch summary
-        epoch_time = time.time() - epoch_start
-        avg_loss = epoch_loss / max(num_batches, 1)
-        avg_drift = epoch_drift_norm / max(num_batches, 1)
-        print(
-            f"\nEpoch {epoch+1} completed in {epoch_time:.1f}s | "
-            f"Avg Loss: {avg_loss:.4f} | "
-            f"Avg Drift Norm: {avg_drift:.4f}\n"
+    uncond_queue: Optional[GlobalSampleQueue] = None
+    if config["batch_n_uncond"] > 0:
+        uncond_queue = GlobalSampleQueue(
+            queue_size=config["uncond_queue_size"],
+            sample_shape=(config["in_channels"], config["img_size"], config["img_size"]),
         )
 
-        # Save checkpoint
-        if (epoch + 1) % save_interval == 0:
-            ckpt_path = output_dir / f"checkpoint_epoch{epoch+1}.pt"
+    start_epoch = 0
+    global_step = 0
+    if args.resume:
+        checkpoint = load_checkpoint(args.resume, model, ema, optimizer, scheduler)
+        start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(checkpoint["step"])
+        if is_main:
+            print(f"Resumed from epoch {start_epoch}, step {global_step}")
+
+    wandb_run = maybe_init_wandb(args, config, is_main)
+    fid_real_images: Optional[torch.Tensor] = None
+    if is_main and wandb_run is not None and args.wandb_fid_interval > 0:
+        fid_workers = max(0, args.fid_num_workers)
+        fid_loader = DataLoader(
+            test_dataset,
+            batch_size=args.fid_batch_size,
+            shuffle=True,
+            num_workers=fid_workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=fid_workers > 0,
+        )
+        real_batches = []
+        real_count = 0
+        for batch in fid_loader:
+            if isinstance(batch, (list, tuple)):
+                x_real = batch[0]
+            else:
+                x_real = batch
+            remaining = args.fid_num_samples - real_count
+            if remaining <= 0:
+                break
+            if x_real.shape[0] > remaining:
+                x_real = x_real[:remaining]
+            real_batches.append(x_real.cpu())
+            real_count += int(x_real.shape[0])
+            if real_count >= args.fid_num_samples:
+                break
+        if real_batches:
+            fid_real_images = torch.cat(real_batches, dim=0)
+        else:
+            print("No real images collected for FID; disabling FID logging.")
+
+    if is_main:
+        print(f"Starting training for {config['epochs']} epochs...")
+
+    for epoch in range(start_epoch, config["epochs"]):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
+        epoch_start = time.time()
+        epoch_loss = 0.0
+        epoch_grad = 0.0
+        n_batches = 0
+
+        fill_queues(
+            class_queue,
+            uncond_queue,
+            train_loader,
+            min_class_samples=min(config["batch_n_pos"], config["queue_size"]),
+            min_uncond_samples=(
+                max(1, min(config["batch_n_uncond"], config["uncond_queue_size"]))
+                if uncond_queue is not None
+                else 0
+            ),
+        )
+
+        for batch in train_loader:
+            if isinstance(batch, (list, tuple)):
+                x_real, labels_real = batch[0], batch[1]
+            else:
+                x_real = batch
+                labels_real = torch.zeros(x_real.shape[0], dtype=torch.long)
+            x_real = x_real.to(device, non_blocking=True)
+            labels_real = labels_real.to(device, non_blocking=True)
+
+            class_queue.add(x_real, labels_real)
+            if uncond_queue is not None:
+                uncond_queue.add(x_real)
+
+            info = train_step(
+                model_for_train=model_for_train,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                ema=ema,
+                class_queue=class_queue,
+                uncond_queue=uncond_queue,
+                config=config,
+                device=device,
+                feature_encoder=feature_encoder,
+            )
+            if info is None:
+                continue
+            global_step += 1
+
+            info = reduce_info(info, device=device, distributed=distributed, world_size=world_size)
+            epoch_loss += info["loss"]
+            epoch_grad += info["grad_norm"]
+            n_batches += 1
+
+            if is_main and global_step % args.log_interval == 0:
+                lr = scheduler.get_lr()
+                print(
+                    f"Epoch {epoch + 1}/{config['epochs']} | Step {global_step} | "
+                    f"Loss: {info['loss']:.4f} | "
+                    f"Grad: {info['grad_norm']:.4f} | LR: {lr:.6f}"
+                )
+                if wandb_run is not None:
+                    train_payload = {
+                        "train/loss": info["loss"],
+                        "train/grad_norm": info["grad_norm"],
+                        "train/lr": lr,
+                    }
+                    if "Z_pos" in info:
+                        train_payload["train/Z_pos"] = info["Z_pos"]
+                    if "Z_neg" in info:
+                        train_payload["train/Z_neg"] = info["Z_neg"]
+
+                    for key in ("alpha_mean", "alpha_std", "alpha_min", "alpha_max"):
+                        if key in info:
+                            train_payload[f"train/{key}"] = info[key]
+
+                    wandb_run.log(train_payload, step=global_step)
+            if (
+                is_main
+                and wandb_run is not None
+                and fid_real_images is not None
+                and args.wandb_fid_interval > 0
+                and global_step % args.wandb_fid_interval == 0
+            ):
+                fid_score = compute_fid_score(
+                    model=ema.shadow,
+                    real_images=fid_real_images,
+                    in_channels=config["in_channels"],
+                    img_size=config["img_size"],
+                    num_classes=max(1, config["num_classes"]),
+                    device=device,
+                    num_samples=args.fid_num_samples,
+                    batch_size=args.fid_batch_size,
+                    alpha=args.preview_alpha,
+                )
+                if math.isfinite(fid_score):
+                    print(f"Step {global_step} | FID: {fid_score:.4f}")
+                    wandb_run.log({"eval/fid": fid_score}, step=global_step)
+
+            if is_main and args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0:
+                sample_path = output_dir / f"samples_step{global_step}.png"
+                preview_images = generate_class_grid(
+                    model=ema.shadow,
+                    in_channels=config["in_channels"],
+                    img_size=config["img_size"],
+                    num_classes=min(config["num_classes"], config["preview_classes"]),
+                    device=device,
+                    samples_per_class=args.preview_samples_per_class,
+                    alpha=args.preview_alpha,
+                )
+                save_image_grid(preview_images, str(sample_path), nrow=args.preview_samples_per_class)
+                if wandb_run is not None:
+                    wandb_run.log({"samples/step_grid": wandb.Image(str(sample_path))}, step=global_step)
+                print(f"Saved samples to {sample_path}")
+
+        if n_batches == 0:
+            avg_loss = 0.0
+            avg_grad = 0.0
+        else:
+            avg_loss = epoch_loss / n_batches
+            avg_grad = epoch_grad / n_batches
+
+        if is_main:
+            epoch_time = time.time() - epoch_start
+            print(
+                f"Epoch {epoch + 1} done in {epoch_time:.1f}s | "
+                f"Avg Loss: {avg_loss:.4f} | Avg Grad: {avg_grad:.4f}"
+            )
+
+        if is_main and (epoch + 1) % args.save_interval == 0:
+            ckpt_path = output_dir / "checkpoint.pt"
             save_checkpoint(
                 str(ckpt_path),
                 model,
@@ -527,129 +760,71 @@ def train(
             )
             print(f"Saved checkpoint to {ckpt_path}")
 
-        # Generate samples
-        if (epoch + 1) % sample_interval == 0:
-            sample_path = output_dir / f"samples_epoch{epoch+1}.png"
-            generate_samples(
-                ema.shadow,
-                config,
-                device,
-                str(sample_path),
-                num_per_class=8,
-            )
-            print(f"Saved samples to {sample_path}")
-
-    # Final checkpoint
-    final_path = output_dir / "checkpoint_final.pt"
-    save_checkpoint(
-        str(final_path),
-        model,
-        ema,
-        optimizer,
-        scheduler,
-        config["epochs"] - 1,
-        global_step,
-        config,
-    )
-    print(f"Training complete! Final checkpoint saved to {final_path}")
-
-
-@torch.no_grad()
-def generate_samples(
-    model: nn.Module,
-    config: dict,
-    device: torch.device,
-    save_path: str,
-    num_per_class: int = 8,
-    alpha: float = 1.5,
-):
-    """Generate samples for visualization."""
-    model.eval()
-
-    num_classes = config["num_classes"]
-    in_channels = config["in_channels"]
-    img_size = config["img_size"]
-
-    # Generate samples for each class
-    samples = []
-    for c in range(num_classes):
-        noise = torch.randn(num_per_class, in_channels, img_size, img_size, device=device)
-        labels = torch.full((num_per_class,), c, device=device, dtype=torch.long)
-        alpha_tensor = torch.full((num_per_class,), alpha, device=device)
-
-        # Use CFG
-        x = model.forward_with_cfg(noise, labels, alpha=alpha)
-        samples.append(x)
-
-    samples = torch.cat(samples, dim=0)
-    samples = samples.clamp(-1, 1)
-
-    save_image_grid(samples, save_path, nrow=num_per_class)
+    if wandb_run is not None:
+        wandb_run.finish()
+    cleanup_distributed(distributed)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train Drifting Models")
+
     parser.add_argument(
         "--dataset",
         type=str,
         default="mnist",
-        help="Dataset to train on",
+        choices=list(DATASET_CONFIG_FILES.keys()),
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./outputs",
-        help="Output directory",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume from",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="Number of data loading workers",
-    )
-    parser.add_argument(
-        "--log_interval",
-        type=int,
-        default=100,
-        help="Logging interval (steps)",
-    )
-    parser.add_argument(
-        "--save_interval",
-        type=int,
-        default=10,
-        help="Checkpoint save interval (epochs)",
-    )
-    parser.add_argument(
-        "--sample_interval",
-        type=int,
-        default=10,
-        help="Sample generation interval (epochs)",
-    )
+    parser.add_argument("--data_root", type=str, default="./data")
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--resume", type=str, default=None)
 
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--save_interval", type=int, default=1)
+    parser.add_argument("--sample_every_steps", type=int, default=1000)
+    parser.add_argument("--preview_samples_per_class", type=int, default=4)
+    parser.add_argument("--preview_alpha", type=float, default=1.5)
+
+    parser.add_argument("--amp", action="store_true", default=False)
+    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="drifting-model",
+    )
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument(
+        "--wandb_key_file",
+        type=str,
+        default="../../.netcr_wandb",
+    )
+    parser.add_argument(
+        "--wandb_fid_interval",
+        type=int,
+        default=0,
+        help="Log FID to W&B every N steps (0 disables FID logging).",
+    )
+    parser.add_argument(
+        "--fid_num_samples",
+        type=int,
+        default=1000,
+        help="Number of real/fake samples used per FID evaluation.",
+    )
+    parser.add_argument(
+        "--fid_batch_size",
+        type=int,
+        default=128,
+        help="Batch size used for generated and real samples in FID evaluation.",
+    )
+    parser.add_argument(
+        "--fid_num_workers",
+        type=int,
+        default=2,
+        help="Number of dataloader workers used for FID real-image loader.",
+    )
     args = parser.parse_args()
-
-    train(
-        dataset=args.dataset,
-        output_dir=args.output_dir,
-        resume=args.resume,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        log_interval=args.log_interval,
-        save_interval=args.save_interval,
-        sample_interval=args.sample_interval,
-    )
+    train(args)
 
 
 if __name__ == "__main__":

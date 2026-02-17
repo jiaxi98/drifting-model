@@ -81,7 +81,7 @@ def generate_class_grid(
     alpha: float = 1.5,
 ) -> torch.Tensor:
     """
-    Generate a grid of samples with each row being one class.
+    Generate a visualization grid where each row corresponds to one class.
 
     Args:
         model: The generator model
@@ -177,17 +177,11 @@ def compute_fid_score(
     Returns:
         FID score
     """
-    try:
-        from torchmetrics.image.fid import FrechetInceptionDistance
-        fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-    except ImportError:
-        print("torchmetrics not available, skipping FID computation")
-        return float("nan")
-
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
     model.eval()
 
     # Add real images
-    print("Processing real images for FID...")
     for i in range(0, len(real_images), batch_size):
         batch = real_images[i:i+batch_size].to(device)
         # Convert to [0, 1] range and replicate channels if grayscale
@@ -199,7 +193,6 @@ def compute_fid_score(
         fid_metric.update(batch, real=True)
 
     # Generate and add fake images
-    print("Generating samples for FID...")
     num_generated = 0
     while num_generated < num_samples:
         current_batch = min(batch_size, num_samples - num_generated)
@@ -231,19 +224,22 @@ def sample_and_save(
     dataset: str = "mnist",
     num_samples: int = 100,
     samples_per_class: int = 10,
+    max_grid_classes: int = 20,
     alpha: float = 1.5,
     seed: int = 42,
     compute_fid: bool = False,
 ):
     """
-    Load model and generate samples.
+    Load a trained model checkpoint and generate sampling visualizations.
 
     Args:
         checkpoint_path: Path to model checkpoint
         output_dir: Directory to save samples
-        dataset: Dataset name ("mnist" or "cifar10")
+        dataset: Dataset name ("mnist", "cifar", or "imagenet")
         num_samples: Number of random samples to generate
-        samples_per_class: Number of samples per class for grid
+        samples_per_class: Number of samples per class for visualization grid
+        max_grid_classes: Upper bound on class-grid rows (visualization-only cap;
+            useful for large-class datasets such as ImageNet-1K)
         alpha: CFG scale
         seed: Random seed
         compute_fid: Whether to compute FID score
@@ -263,14 +259,19 @@ def sample_and_save(
     # Determine model config
     if dataset.lower() == "mnist":
         model_name = config.get("model", "DriftDiT-Tiny")
-        in_channels = 1
-        img_size = 32
-        num_classes = 10
-    else:
+        in_channels = config.get("in_channels", 1)
+        img_size = config.get("img_size", 32)
+        num_classes = config.get("num_classes", 10)
+    elif dataset.lower() == "cifar":
         model_name = config.get("model", "DriftDiT-Small")
-        in_channels = 3
-        img_size = 32
-        num_classes = 10
+        in_channels = config.get("in_channels", 3)
+        img_size = config.get("img_size", 32)
+        num_classes = config.get("num_classes", 10)
+    else:
+        model_name = config.get("model", "DriftDiT-B16")
+        in_channels = config.get("in_channels", 3)
+        img_size = config.get("img_size", 256)
+        num_classes = config.get("num_classes", 1000)
 
     # Create model
     model_fn = DriftDiT_models[model_name]
@@ -290,13 +291,16 @@ def sample_and_save(
     model.eval()
     print(f"Model loaded: {model_name}")
 
-    # Generate class grid
-    print(f"Generating class grid ({num_classes} classes x {samples_per_class} samples)...")
+    # Generate a class-structured visualization grid.
+    # This is only for qualitative inspection during sampling (not used in training).
+    # For large-class datasets (e.g., ImageNet-1K), cap rows to keep memory/image size reasonable.
+    grid_classes = min(num_classes, max_grid_classes)
+    print(f"Generating class grid ({grid_classes} classes x {samples_per_class} samples)...")
     grid = generate_class_grid(
         model,
         in_channels,
         img_size,
-        num_classes,
+        grid_classes,
         device,
         samples_per_class=samples_per_class,
         alpha=alpha,
@@ -350,12 +354,22 @@ def sample_and_save(
                 transforms.Normalize([0.5], [0.5]),
             ])
             test_dataset = datasets.MNIST("./data", train=False, download=True, transform=transform)
-        else:
+        elif dataset.lower() == "cifar":
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
             ])
             test_dataset = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
+        else:
+            transform = transforms.Compose([
+                # Standard ImageNet eval-style preprocessing:
+                # resize short side first, then center-crop to model resolution.
+                transforms.Resize(int(img_size * 256 / 224)),
+                transforms.CenterCrop(img_size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ])
+            test_dataset = datasets.ImageFolder("./data/val", transform=transform)
 
         real_images = torch.stack([test_dataset[i][0] for i in range(len(test_dataset))])
 
@@ -396,7 +410,7 @@ def main():
         "--dataset",
         type=str,
         default="mnist",
-        choices=["mnist", "cifar10"],
+        choices=["mnist", "cifar", "imagenet"],
         help="Dataset (for determining model config)",
     )
     parser.add_argument(
@@ -410,6 +424,12 @@ def main():
         type=int,
         default=10,
         help="Number of samples per class for grid",
+    )
+    parser.add_argument(
+        "--max_grid_classes",
+        type=int,
+        default=20,
+        help="Maximum classes shown in visualization grid (sampling-only, useful for ImageNet)",
     )
     parser.add_argument(
         "--alpha",
@@ -437,6 +457,7 @@ def main():
         dataset=args.dataset,
         num_samples=args.num_samples,
         samples_per_class=args.samples_per_class,
+        max_grid_classes=args.max_grid_classes,
         alpha=args.alpha,
         seed=args.seed,
         compute_fid=args.compute_fid,

@@ -324,16 +324,23 @@ class StyleEmbedder(nn.Module):
         self.codebook_size = codebook_size
         self.codebook = nn.Embedding(codebook_size, hidden_size)
 
-    def forward(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Generate random style embeddings."""
-        # Random indices for each sample in the batch
-        indices = torch.randint(
+    def sample_indices(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Sample random style-token indices."""
+        return torch.randint(
             0, self.codebook_size, (batch_size, self.num_tokens), device=device
         )
+
+    def forward(
+        self,
+        batch_size: int,
+        device: torch.device,
+        indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Generate style embeddings from sampled or provided indices."""
+        if indices is None:
+            indices = self.sample_indices(batch_size, device)
         embeddings = self.codebook(indices)  # (B, num_tokens, D)
-        # Sum over tokens
-        style = embeddings.sum(dim=1)  # (B, D)
-        return style
+        return embeddings.sum(dim=1)  # (B, D)
 
 
 class DriftDiT(nn.Module):
@@ -356,7 +363,7 @@ class DriftDiT(nn.Module):
         mlp_ratio: float = 4.0,
         num_classes: int = 10,
         label_dropout: float = 0.1,
-        num_register_tokens: int = 8,
+        num_register_tokens: int = 16,
         use_style_embed: bool = True,
     ):
         super().__init__()
@@ -461,6 +468,7 @@ class DriftDiT(nn.Module):
         labels: torch.Tensor,
         alpha: torch.Tensor,
         force_drop_ids: Optional[torch.Tensor] = None,
+        style_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -492,7 +500,7 @@ class DriftDiT(nn.Module):
         c = self.label_embed(labels, self.training, force_drop_ids)
         c = c + self.alpha_embed(alpha)
         if self.use_style_embed:
-            c = c + self.style_embed(B, device)
+            c = c + self.style_embed(B, device, indices=style_indices)
 
         # Transformer blocks
         for block in self.blocks:
@@ -531,10 +539,18 @@ class DriftDiT(nn.Module):
         # Create alpha tensor
         alpha_tensor = torch.full((B,), alpha, device=device, dtype=x.dtype)
 
+        # Reuse identical style randomness for cond/uncond branches.
+        style_indices = None
+        if self.use_style_embed:
+            style_indices = self.style_embed.sample_indices(B, device)
+
         # Duplicate inputs for conditional and unconditional
         x_combined = torch.cat([x, x], dim=0)
         labels_combined = torch.cat([labels, labels], dim=0)
         alpha_combined = torch.cat([alpha_tensor, alpha_tensor], dim=0)
+        style_combined = None
+        if style_indices is not None:
+            style_combined = torch.cat([style_indices, style_indices], dim=0)
 
         # Force unconditional for second half
         force_drop = torch.cat([
@@ -543,7 +559,13 @@ class DriftDiT(nn.Module):
         ]).bool()
 
         # Forward pass
-        out = self.forward(x_combined, labels_combined, alpha_combined, force_drop)
+        out = self.forward(
+            x_combined,
+            labels_combined,
+            alpha_combined,
+            force_drop,
+            style_indices=style_combined,
+        )
 
         # Split and apply CFG
         cond, uncond = out.chunk(2, dim=0)
@@ -580,8 +602,72 @@ def DriftDiT_Small(img_size=32, in_channels=3, num_classes=10, **kwargs):
     )
 
 
+def DriftDiT_B16(img_size=256, in_channels=3, num_classes=1000, **kwargs):
+    """DiT-B/16 style configuration for ImageNet-scale experiments."""
+    return DriftDiT(
+        img_size=img_size,
+        patch_size=16,
+        in_channels=in_channels,
+        hidden_size=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        num_classes=num_classes,
+        **kwargs,
+    )
+
+
+def DriftDiT_L16(img_size=256, in_channels=3, num_classes=1000, **kwargs):
+    """DiT-L/16 style configuration for ImageNet-scale experiments."""
+    return DriftDiT(
+        img_size=img_size,
+        patch_size=16,
+        in_channels=in_channels,
+        hidden_size=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4.0,
+        num_classes=num_classes,
+        **kwargs,
+    )
+
+
+def DriftDiT_B2(img_size=32, in_channels=4, num_classes=1000, **kwargs):
+    """DiT-B/2 style configuration for latent ImageNet experiments."""
+    return DriftDiT(
+        img_size=img_size,
+        patch_size=2,
+        in_channels=in_channels,
+        hidden_size=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        num_classes=num_classes,
+        **kwargs,
+    )
+
+
+def DriftDiT_L2(img_size=32, in_channels=4, num_classes=1000, **kwargs):
+    """DiT-L/2 style configuration for latent ImageNet experiments."""
+    return DriftDiT(
+        img_size=img_size,
+        patch_size=2,
+        in_channels=in_channels,
+        hidden_size=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4.0,
+        num_classes=num_classes,
+        **kwargs,
+    )
+
+
 # Model registry
 DriftDiT_models = {
     "DriftDiT-Tiny": DriftDiT_Tiny,
     "DriftDiT-Small": DriftDiT_Small,
+    "DriftDiT-B2": DriftDiT_B2,
+    "DriftDiT-L2": DriftDiT_L2,
+    "DriftDiT-B16": DriftDiT_B16,
+    "DriftDiT-L16": DriftDiT_L16,
 }

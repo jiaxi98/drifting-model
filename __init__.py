@@ -5,7 +5,16 @@ A PyTorch reproduction of "Generative Modeling via Drifting" (Deng et al., 2026)
 for MNIST and CIFAR-10 datasets.
 """
 
-from .model import DriftDiT, DriftDiT_Tiny, DriftDiT_Small, DriftDiT_models
+from .model import (
+    DriftDiT,
+    DriftDiT_Tiny,
+    DriftDiT_Small,
+    DriftDiT_B2,
+    DriftDiT_L2,
+    DriftDiT_B16,
+    DriftDiT_L16,
+    DriftDiT_models,
+)
 from .drifting import (
     compute_V,
     compute_V_multi_temperature,
@@ -39,6 +48,10 @@ __all__ = [
     "DriftDiT",
     "DriftDiT_Tiny",
     "DriftDiT_Small",
+    "DriftDiT_B2",
+    "DriftDiT_L2",
+    "DriftDiT_B16",
+    "DriftDiT_L16",
     "DriftDiT_models",
     # Drifting
     "compute_V",

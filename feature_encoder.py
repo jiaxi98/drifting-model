@@ -24,11 +24,20 @@ class PretrainedResNetEncoder(nn.Module):
     def __init__(
         self,
         pretrained: bool = True,
+        arch: str = "resnet18",
     ):
         super().__init__()
+        self.expected_in_channels = 3
 
-        # Load pretrained ResNet18
-        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
+        arch = arch.lower()
+        if arch == "resnet18":
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            resnet = models.resnet18(weights=weights)
+        elif arch == "resnet50":
+            weights = models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+            resnet = models.resnet50(weights=weights)
+        else:
+            raise ValueError(f"Unsupported pretrained encoder arch: {arch}")
 
         # Extract layers (don't include final fc)
         self.conv1 = resnet.conv1
@@ -47,7 +56,7 @@ class PretrainedResNetEncoder(nn.Module):
         Returns:
             List of feature maps at different scales, each (B, C, H, W)
         """
-        # Resize if needed (CIFAR is 32x32)
+        # Resize small inputs (e.g., CIFAR) to keep early feature maps meaningful.
         if x.shape[-1] < 64:
             x = F.interpolate(x, size=64, mode='bilinear', align_corners=False)
 
@@ -62,6 +71,52 @@ class PretrainedResNetEncoder(nn.Module):
         f4 = self.layer4(f3)  # (B, 512, H/32, W/32)
 
         return [f1, f2, f3, f4]
+
+
+class PretrainedConvNeXtV2Encoder(nn.Module):
+    """
+    Feature encoder using pretrained ConvNeXt-V2 from Hugging Face.
+    Returns multi-scale feature MAPS (B, C, H, W) for per-location drifting loss.
+    """
+
+    def __init__(
+        self,
+        pretrained_name_or_path: str = "facebook/convnextv2-large-22k-224",
+        local_files_only: bool = False,
+    ):
+        super().__init__()
+        from transformers import ConvNextV2Model
+
+        self.backbone = ConvNextV2Model.from_pretrained(
+            pretrained_name_or_path,
+            local_files_only=local_files_only,
+        )
+        self.expected_in_channels = 3
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # Train pipeline uses [-1, 1] tensors; convert to ImageNet normalization.
+        x = (x + 1.0) * 0.5
+        x = x.clamp(0.0, 1.0)
+        return (x - self.pixel_mean) / self.pixel_std
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        x = self._normalize(x)
+        outputs = self.backbone(x, output_hidden_states=True, return_dict=True)
+        hidden_states = list(outputs.hidden_states)
+        if len(hidden_states) < 2:
+            raise RuntimeError("ConvNeXt-V2 encoder did not return multi-scale hidden states.")
+        # hidden_states[0] is patch embedding output; use 4 stage features.
+        return hidden_states[1:]
 
 
 class BasicBlock(nn.Module):
@@ -333,24 +388,87 @@ class MAEEncoder(nn.Module):
         return loss, pred, mask
 
 
+def extract_feature_sets(
+    x: torch.Tensor,
+    feature_encoder: Optional[nn.Module],
+    vae_decoder: Optional[nn.Module],
+    use_pixel_space: bool,
+) -> List[torch.Tensor]:
+    """
+    Build drifting-loss feature sets from pixels or encoder feature maps.
+
+    Returns a list of (B, D) tensors. In pixel mode this is a single flattened tensor.
+    """
+    if use_pixel_space or feature_encoder is None:
+        return [x.flatten(start_dim=1)]
+
+    encoder_input = x
+    encoder_channels = int(getattr(feature_encoder, "expected_in_channels", x.shape[1]))
+    if x.shape[1] != encoder_channels:
+        if vae_decoder is None:
+            raise ValueError(
+                "Feature extractor channel mismatch and no VAE decoder is configured. "
+                f"Got x with {x.shape[1]} channels, encoder expects {encoder_channels}."
+            )
+        if x.shape[1] != 4 or encoder_channels != 3:
+            raise ValueError(
+                "Unsupported latent->feature conversion. "
+                f"Got x channels={x.shape[1]}, encoder channels={encoder_channels}."
+            )
+        scale = float(getattr(vae_decoder.config, "scaling_factor", 0.18215))
+        encoder_input = vae_decoder.decode(x / scale).sample
+
+    feature_maps = feature_encoder(encoder_input)
+    features: List[torch.Tensor] = []
+
+    # Include raw-input energy statistics alongside encoder features.
+    features.append((encoder_input ** 2).mean(dim=(2, 3)))
+
+    for fmap in feature_maps:
+        mean_vec = F.adaptive_avg_pool2d(fmap, 1).flatten(1)
+        std_vec = fmap.flatten(2).std(dim=2, unbiased=False)
+        features.append(mean_vec)
+        features.append(std_vec)
+
+    return features
+
+
 def create_feature_encoder(
-    dataset: str = "cifar10",
+    dataset: str = "cifar",
     feature_dim: int = 512,
     multi_scale: bool = True,
     use_pretrained: bool = True,
+    pretrained_arch: str = "resnet18",
+    pretrained_path: Optional[str] = None,
 ):
     """
     Create a feature encoder for the specified dataset.
 
     Args:
-        dataset: "mnist" or "cifar10"
+        dataset: "mnist", "cifar", or "imagenet"
         feature_dim: Output feature dimension (ignored for pretrained)
         multi_scale: Whether to use multi-scale features
-        use_pretrained: Whether to use ImageNet-pretrained ResNet (for CIFAR)
+        use_pretrained: Whether to use ImageNet-pretrained ResNet
+        pretrained_arch: Backbone arch for pretrained encoder.
+            Supported values: "resnet18", "resnet50", "convnextv2-large"
+        pretrained_path: Optional local/remote checkpoint path for pretrained encoder
 
     Returns:
         Feature encoder
     """
+    arch = pretrained_arch.lower()
+
+    def build_pretrained_encoder():
+        if arch in {"resnet18", "resnet50"}:
+            return PretrainedResNetEncoder(pretrained=True, arch=arch)
+        if arch in {"convnextv2-large", "convnextv2"}:
+            model_name_or_path = pretrained_path or "facebook/convnextv2-large-22k-224"
+            return PretrainedConvNeXtV2Encoder(
+                pretrained_name_or_path=model_name_or_path,
+                local_files_only=bool(pretrained_path),
+            )
+        raise ValueError(f"Unsupported pretrained encoder arch: {pretrained_arch}")
+
     if dataset.lower() == "mnist":
         return MultiScaleFeatureEncoder(
             in_channels=1,
@@ -359,10 +477,9 @@ def create_feature_encoder(
             feature_dim=feature_dim,
             multi_scale=multi_scale,
         )
-    elif dataset.lower() in ["cifar10", "cifar"]:
+    elif dataset.lower() in ["cifar"]:
         if use_pretrained:
-            # Use ImageNet-pretrained ResNet - returns multi-scale feature maps
-            return PretrainedResNetEncoder(pretrained=True)
+            return build_pretrained_encoder()
         else:
             return MultiScaleFeatureEncoder(
                 in_channels=3,
@@ -371,6 +488,16 @@ def create_feature_encoder(
                 feature_dim=feature_dim,
                 multi_scale=multi_scale,
             )
+    elif dataset.lower() in ["imagenet"]:
+        if use_pretrained:
+            return build_pretrained_encoder()
+        return MultiScaleFeatureEncoder(
+            in_channels=3,
+            base_width=256,
+            blocks_per_stage=2,
+            feature_dim=feature_dim,
+            multi_scale=multi_scale,
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 

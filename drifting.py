@@ -14,6 +14,7 @@ def compute_V(
     y_neg: torch.Tensor,
     temperature: float,
     mask_self: bool = True,
+    neg_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute the drifting field V (Algorithm 2 from paper, Page 12).
@@ -25,7 +26,8 @@ def compute_V(
         y_pos: Positive (real data) samples, shape (N_pos, D)
         y_neg: Negative (generated) samples, shape (N_neg, D)
         temperature: Temperature for softmax (smaller = sharper)
-        mask_self: Whether to mask self-distances (when y_neg == x)
+        mask_self: Whether to mask self-distances (when y_neg includes x in first N entries)
+        neg_weights: Optional non-negative weights for negative samples, shape (N_neg,)
 
     Returns:
         V: Drifting field, shape (N, D)
@@ -39,14 +41,21 @@ def compute_V(
     dist_pos = torch.cdist(x, y_pos, p=2)  # (N, N_pos)
     dist_neg = torch.cdist(x, y_neg, p=2)  # (N, N_neg)
 
-    # 2. Mask self-distances (when y_neg contains x)
-    if mask_self and N == N_neg:
+    # 2. Mask self-distances when y_neg starts with x.
+    if mask_self and N_neg >= N:
         mask = torch.eye(N, device=device) * 1e6
-        dist_neg = dist_neg + mask
+        dist_neg[:, :N] = dist_neg[:, :N] + mask
 
     # 3. Compute logits
     logit_pos = -dist_pos / temperature  # (N, N_pos)
     logit_neg = -dist_neg / temperature  # (N, N_neg)
+    if neg_weights is not None:
+        if neg_weights.ndim != 1 or neg_weights.shape[0] != N_neg:
+            raise ValueError(
+                f"neg_weights must have shape ({N_neg},), got {tuple(neg_weights.shape)}"
+            )
+        safe_weights = neg_weights.to(device).clamp_min(1e-12)
+        logit_neg = logit_neg + torch.log(safe_weights).unsqueeze(0)
 
     # 4. Concat for normalization
     logit = torch.cat([logit_pos, logit_neg], dim=1)  # (N, N_pos + N_neg)
@@ -70,7 +79,7 @@ def compute_V(
 
     V = drift_pos - drift_neg
 
-    return V
+    return V, A_pos, A_neg
 
 
 def compute_V_multi_temperature(
@@ -80,6 +89,7 @@ def compute_V_multi_temperature(
     temperatures: List[float] = [0.02, 0.05, 0.2],
     mask_self: bool = True,
     normalize_each: bool = True,
+    neg_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute drifting field with multiple temperatures (Sec A.6).
@@ -94,6 +104,7 @@ def compute_V_multi_temperature(
         temperatures: List of temperature values
         mask_self: Whether to mask self-distances
         normalize_each: Whether to normalize each V before summing
+        neg_weights: Optional non-negative weights for negative samples, shape (N_neg,)
 
     Returns:
         V: Combined drifting field, shape (N, D)
@@ -101,7 +112,14 @@ def compute_V_multi_temperature(
     V_total = torch.zeros_like(x)
 
     for tau in temperatures:
-        V_tau = compute_V(x, y_pos, y_neg, tau, mask_self)
+        V_tau = compute_V(
+            x,
+            y_pos,
+            y_neg,
+            tau,
+            mask_self=mask_self,
+            neg_weights=neg_weights,
+        )
 
         if normalize_each:
             # Normalize so E[||V||^2] ~ 1
@@ -255,9 +273,19 @@ class DriftingLoss(nn.Module):
 
         # Normalize features
         if self.do_normalize_features:
-            feat_gen, scale_gen = normalize_features(feat_gen)
-            feat_pos, _ = normalize_features(feat_pos, target_scale=scale_gen * feat_gen.shape[1] ** 0.5)
-            feat_neg, _ = normalize_features(feat_neg, target_scale=scale_gen * feat_neg.shape[1] ** 0.5)
+            feat_gen, scale_gen, mean_gen, std_gen = normalize_features(feat_gen)
+            feat_pos, _, _, _ = normalize_features(
+                feat_pos,
+                scale=scale_gen,
+                mean=mean_gen,
+                std=std_gen,
+            )
+            feat_neg, _, _, _ = normalize_features(
+                feat_neg,
+                scale=scale_gen,
+                mean=mean_gen,
+                std=std_gen,
+            )
 
         # Compute drifting field
         V = compute_V_multi_temperature(
