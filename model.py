@@ -1,6 +1,6 @@
 """
 DiT-style generator for Drifting Models.
-Adapted for 32x32 images (MNIST, CIFAR-10) with adaLN-Zero conditioning.
+Adapted for 32x32 images (MNIST, CIFAR) with adaLN-Zero conditioning.
 
 Key differences from standard DiT:
 - No timestep input (one-step generator, not diffusion)
@@ -367,6 +367,12 @@ class DriftDiT(nn.Module):
         use_style_embed: bool = True,
     ):
         super().__init__()
+        if img_size % patch_size != 0:
+            raise ValueError(f"img_size ({img_size}) must be divisible by patch_size ({patch_size}).")
+        if hidden_size % num_heads != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})."
+            )
         self.img_size = img_size
         self.patch_size = patch_size
         self.in_channels = in_channels
@@ -603,7 +609,9 @@ def DriftDiT_Small(img_size=32, in_channels=3, num_classes=10, **kwargs):
 
 
 def DriftDiT_B16(img_size=256, in_channels=3, num_classes=1000, **kwargs):
-    """DiT-B/16 style configuration for ImageNet-scale experiments."""
+    """ImageNet DiT-B/16 preset (Table-8 aligned core architecture)."""
+    kwargs.setdefault("num_register_tokens", 16)
+    kwargs.setdefault("use_style_embed", True)
     return DriftDiT(
         img_size=img_size,
         patch_size=16,
@@ -618,7 +626,9 @@ def DriftDiT_B16(img_size=256, in_channels=3, num_classes=1000, **kwargs):
 
 
 def DriftDiT_L16(img_size=256, in_channels=3, num_classes=1000, **kwargs):
-    """DiT-L/16 style configuration for ImageNet-scale experiments."""
+    """ImageNet DiT-L/16 preset (Table-8 aligned core architecture)."""
+    kwargs.setdefault("num_register_tokens", 16)
+    kwargs.setdefault("use_style_embed", True)
     return DriftDiT(
         img_size=img_size,
         patch_size=16,
@@ -633,7 +643,9 @@ def DriftDiT_L16(img_size=256, in_channels=3, num_classes=1000, **kwargs):
 
 
 def DriftDiT_B2(img_size=32, in_channels=4, num_classes=1000, **kwargs):
-    """DiT-B/2 style configuration for latent ImageNet experiments."""
+    """ImageNet latent DiT-B/2 preset (Table-8 aligned core architecture)."""
+    kwargs.setdefault("num_register_tokens", 16)
+    kwargs.setdefault("use_style_embed", True)
     return DriftDiT(
         img_size=img_size,
         patch_size=2,
@@ -648,7 +660,9 @@ def DriftDiT_B2(img_size=32, in_channels=4, num_classes=1000, **kwargs):
 
 
 def DriftDiT_L2(img_size=32, in_channels=4, num_classes=1000, **kwargs):
-    """DiT-L/2 style configuration for latent ImageNet experiments."""
+    """ImageNet latent DiT-L/2 preset (Table-8 aligned core architecture)."""
+    kwargs.setdefault("num_register_tokens", 16)
+    kwargs.setdefault("use_style_embed", True)
     return DriftDiT(
         img_size=img_size,
         patch_size=2,

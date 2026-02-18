@@ -218,6 +218,62 @@ def compute_fid_score(
     return fid_score
 
 
+def compute_is_score(
+    model: nn.Module,
+    in_channels: int,
+    img_size: int,
+    num_classes: int,
+    device: torch.device,
+    num_samples: int = 10000,
+    batch_size: int = 256,
+    alpha: float = 1.5,
+) -> tuple[float, float]:
+    """
+    Compute Inception Score (mean, std) for generated images.
+
+    Args:
+        model: The generator model
+        in_channels: Number of image channels
+        img_size: Image size
+        num_classes: Number of classes
+        device: Device to use
+        num_samples: Number of generated samples used for IS
+        batch_size: Batch size for generation
+        alpha: CFG scale
+
+    Returns:
+        Tuple of (IS mean, IS std)
+    """
+    from torchmetrics.image.inception import InceptionScore
+
+    is_metric = InceptionScore(normalize=True).to(device)
+    model.eval()
+
+    num_generated = 0
+    while num_generated < num_samples:
+        current_batch = min(batch_size, num_samples - num_generated)
+        samples = generate_samples(
+            model,
+            current_batch,
+            in_channels,
+            img_size,
+            num_classes,
+            device,
+            alpha=alpha,
+        )
+        samples = (samples + 1) / 2
+        if in_channels == 1:
+            samples = samples.repeat(1, 3, 1, 1)
+        samples = torch.nn.functional.interpolate(
+            samples, size=(299, 299), mode="bilinear", align_corners=False
+        )
+        is_metric.update(samples)
+        num_generated += current_batch
+
+    is_mean, is_std = is_metric.compute()
+    return float(is_mean.item()), float(is_std.item())
+
+
 def sample_and_save(
     checkpoint_path: str,
     output_dir: str,

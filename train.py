@@ -17,9 +17,9 @@ from datasets.factory import get_dataset
 from drifting import compute_V_from_dists
 from utils.config import DATASET_CONFIG_FILES, get_default_config
 from utils.distributed import cleanup_distributed, reduce_info, setup_distributed
-from feature_encoder import create_feature_encoder, extract_feature_sets
+from feature_encoder import create_feature_encoder, extract_feature_fullsets, extract_feature_sets
 from model import DriftDiT_models
-from sample import compute_fid_score, generate_class_grid
+from sample import compute_fid_score, compute_is_score, generate_class_grid
 from utils import (
     EMA,
     GlobalSampleQueue,
@@ -87,14 +87,16 @@ def compute_drifting_loss(
     n_neg: int,
     n_uncond: int,
     use_pixel_space: bool,
+    use_full_feature_set: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """CFG-aware drifting loss (minimal implementation)."""
     device = x_gen.device
 
-    feat_gen_list = extract_feature_sets(x_gen, feature_encoder, vae_decoder, use_pixel_space)
-    feat_pos_list = extract_feature_sets(x_pos, feature_encoder, vae_decoder, use_pixel_space)
+    feature_fn = extract_feature_fullsets if use_full_feature_set else extract_feature_sets
+    feat_gen_list = feature_fn(x_gen, feature_encoder, vae_decoder, use_pixel_space)
+    feat_pos_list = feature_fn(x_pos, feature_encoder, vae_decoder, use_pixel_space)
     feat_uncond_list = (
-        extract_feature_sets(x_uncond, feature_encoder, vae_decoder, use_pixel_space)
+        feature_fn(x_uncond, feature_encoder, vae_decoder, use_pixel_space)
         if x_uncond is not None
         else []
     )
@@ -132,11 +134,21 @@ def compute_drifting_loss(
             # Reuse the same pairwise distances for A.6 feature scale and all temperatures.
             dist_pos_raw = torch.cdist(feat_gen_c, feat_pos_c, p=2)
             dist_neg_raw = torch.cdist(feat_gen_c, feat_neg, p=2)
+            c_j = float(feat_gen_c.shape[-1])
 
             with torch.no_grad():
                 # S_j = (1/sqrt(C_j)) * E[||phi_j(x)-phi_j(y)||], with stop-grad.
-                s_j = torch.cat([dist_pos_raw, dist_neg_raw], dim=1).mean()
-                s_j = s_j / math.sqrt(float(feat_gen_c.shape[-1]))
+                pos_sum = dist_pos_raw.sum()
+                pos_count = dist_pos_raw.new_tensor(float(dist_pos_raw.numel()))
+                if neg_weights is None:
+                    neg_sum = dist_neg_raw.sum()
+                    neg_count = dist_neg_raw.new_tensor(float(dist_neg_raw.numel()))
+                else:
+                    safe_weights = neg_weights.clamp_min(0.0)
+                    neg_sum = (dist_neg_raw * safe_weights.unsqueeze(0)).sum()
+                    neg_count = safe_weights.sum() * float(dist_neg_raw.shape[0])
+                avg_dist = (pos_sum + neg_sum) / (pos_count + neg_count + 1e-12)
+                s_j = avg_dist / math.sqrt(c_j)
                 s_j = s_j.clamp_min(1e-6)
 
             feat_gen_n = feat_gen_c / s_j
@@ -152,13 +164,14 @@ def compute_drifting_loss(
                     dist_neg=dist_neg,
                     y_pos=feat_pos_n,
                     y_neg=feat_neg_n,
-                    temperature=tau,
+                    temperature=tau * math.sqrt(c_j),
                     mask_self=True,
                     neg_weights=neg_weights,
                 )
                 Z_pos += float(torch.mean(torch.sum(a_pos, dim=-1)).item())
                 Z_neg += float(torch.mean(torch.sum(a_neg, dim=-1)).item())
-                v_tau = v_tau / torch.sqrt(torch.mean(v_tau**2))
+                lambda_j = torch.sqrt(torch.mean(torch.sum(v_tau**2, dim=-1) / c_j) + 1e-8)
+                v_tau = v_tau / lambda_j
                 v_total = v_total + v_tau
 
             target = (feat_gen_n + v_total).detach()
@@ -261,6 +274,7 @@ def train_step(
             n_neg=n_neg,
             n_uncond=n_uncond,
             use_pixel_space=not config["use_feature_encoder"],
+            use_full_feature_set=bool(config.get("use_full_feature_set", False)),
         )
 
     if scaler.is_enabled():
@@ -623,6 +637,20 @@ def train(args):
                 if math.isfinite(fid_score):
                     print(f"Step {global_step} | FID: {fid_score:.4f}")
                     wandb_run.log({"eval/fid": fid_score}, step=global_step)
+
+                is_mean, is_std = compute_is_score(
+                    model=ema.shadow,
+                    in_channels=config["in_channels"],
+                    img_size=config["img_size"],
+                    num_classes=max(1, config["num_classes"]),
+                    device=device,
+                    num_samples=args.fid_num_samples,
+                    batch_size=args.fid_batch_size,
+                    alpha=args.preview_alpha,
+                )
+                if math.isfinite(is_mean) and math.isfinite(is_std):
+                    print(f"Step {global_step} | IS: {is_mean:.4f} ± {is_std:.4f}")
+                    wandb_run.log({"eval/is": is_mean, "eval/is_std": is_std}, step=global_step)
 
             if is_main and args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0:
                 sample_path = output_dir / f"samples_step{global_step}.png"

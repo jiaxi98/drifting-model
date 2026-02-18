@@ -1,6 +1,6 @@
 """
 Simple CNN feature encoder for drifting loss.
-Multi-scale ResNet-style architecture for MNIST and CIFAR-10.
+Multi-scale ResNet-style architecture for MNIST and CIFAR.
 
 Phase 1: Can skip feature encoder and compute drifting loss in pixel space
 Phase 2: Use this encoder trained with MAE objective for better results
@@ -429,6 +429,113 @@ def extract_feature_sets(
         std_vec = fmap.flatten(2).std(dim=2, unbiased=False)
         features.append(mean_vec)
         features.append(std_vec)
+
+    return features
+
+
+def extract_feature_fullsets(
+    x: torch.Tensor,
+    feature_encoder: Optional[nn.Module],
+    vae_decoder: Optional[nn.Module],
+    use_pixel_space: bool,
+    include_vanilla: bool = True,
+) -> List[torch.Tensor]:
+    """
+    Build the full feature set described in Appendix A.5.
+
+    Returned vectors follow:
+      - vanilla term (optional): flattened x
+      - input energy: per-channel mean of x^2 on encoder input
+      - per feature map:
+        (a) per-location vectors
+        (b) global mean + global std
+        (c) non-overlapping 2x2 patch mean vectors + std vectors
+        (d) non-overlapping 4x4 patch mean vectors + std vectors
+    """
+    features: List[torch.Tensor] = []
+
+    # Vanilla drifting term (without phi), as in A.5.
+    if include_vanilla:
+        features.append(x.flatten(start_dim=1))
+
+    encoder_input = x
+    if not use_pixel_space and feature_encoder is not None:
+        encoder_channels = int(getattr(feature_encoder, "expected_in_channels", x.shape[1]))
+        if x.shape[1] != encoder_channels:
+            if vae_decoder is None:
+                raise ValueError(
+                    "Feature extractor channel mismatch and no VAE decoder is configured. "
+                    f"Got x with {x.shape[1]} channels, encoder expects {encoder_channels}."
+                )
+            if x.shape[1] != 4 or encoder_channels != 3:
+                raise ValueError(
+                    "Unsupported latent->feature conversion. "
+                    f"Got x channels={x.shape[1]}, encoder channels={encoder_channels}."
+                )
+            scale = float(getattr(vae_decoder.config, "scaling_factor", 0.18215))
+            encoder_input = vae_decoder.decode(x / scale).sample
+        feature_maps = feature_encoder(encoder_input)
+    else:
+        feature_maps = []
+
+    # Encoder-input energy feature: mean(x^2) per channel.
+    features.append((encoder_input ** 2).mean(dim=(2, 3)))
+
+    if isinstance(feature_maps, torch.Tensor):
+        feature_map_list = [feature_maps]
+    else:
+        feature_map_list = list(feature_maps)
+
+    for fmap in feature_map_list:
+        if fmap.dim() != 4:
+            if fmap.dim() == 2:
+                features.append(fmap)
+                continue
+            raise ValueError(
+                "Expected encoder feature map with shape (B, C, H, W) "
+                f"or (B, C), got shape {tuple(fmap.shape)}."
+            )
+
+        bsz, channels, height, width = fmap.shape
+
+        # (a) Per-location vectors: Hi*Wi vectors, each C-dim.
+        per_location = fmap.permute(0, 2, 3, 1).reshape(bsz, height * width, channels)
+        for vec in per_location.unbind(dim=1):
+            features.append(vec)
+
+        # (b) Global mean/std vectors, each C-dim.
+        features.append(F.adaptive_avg_pool2d(fmap, 1).flatten(1))
+        features.append(fmap.flatten(2).std(dim=2, unbiased=False))
+
+        # (c) 2x2 patch mean/std vectors (non-overlapping).
+        if height >= 2 and width >= 2:
+            h2, w2 = height // 2, width // 2
+            fmap2 = fmap[:, :, : h2 * 2, : w2 * 2]
+            mean2 = F.avg_pool2d(fmap2, kernel_size=2, stride=2)
+            patch2 = F.unfold(fmap2, kernel_size=2, stride=2).view(bsz, channels, 4, h2 * w2)
+            std2 = patch2.std(dim=2, unbiased=False).view(bsz, channels, h2, w2)
+
+            mean2_vecs = mean2.permute(0, 2, 3, 1).reshape(bsz, h2 * w2, channels)
+            std2_vecs = std2.permute(0, 2, 3, 1).reshape(bsz, h2 * w2, channels)
+            for vec in mean2_vecs.unbind(dim=1):
+                features.append(vec)
+            for vec in std2_vecs.unbind(dim=1):
+                features.append(vec)
+
+        # (d) 4x4 patch mean/std vectors (non-overlapping).
+        if height >= 4 and width >= 4:
+            h4, w4 = height // 4, width // 4
+            fmap4 = fmap[:, :, : h4 * 4, : w4 * 4]
+            mean4 = F.avg_pool2d(fmap4, kernel_size=4, stride=4)
+            patch4 = F.unfold(fmap4, kernel_size=4, stride=4).view(bsz, channels, 16, h4 * w4)
+            std4 = patch4.std(dim=2, unbiased=False).view(bsz, channels, h4, w4)
+
+            mean4_vecs = mean4.permute(0, 2, 3, 1).reshape(bsz, h4 * w4, channels)
+            std4_vecs = std4.permute(0, 2, 3, 1).reshape(bsz, h4 * w4, channels)
+            for vec in mean4_vecs.unbind(dim=1):
+                features.append(vec)
+            for vec in std4_vecs.unbind(dim=1):
+                features.append(vec)
 
     return features
 
