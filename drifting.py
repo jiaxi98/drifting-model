@@ -8,6 +8,86 @@ import torch.nn as nn
 from typing import List, Optional, Tuple
 
 
+def compute_V_from_dists(
+    dist_pos: torch.Tensor,
+    dist_neg: torch.Tensor,
+    y_pos: torch.Tensor,
+    y_neg: torch.Tensor,
+    temperature: float,
+    mask_self: bool = True,
+    neg_weights: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute drifting field V from precomputed pairwise distances.
+
+    Args:
+        dist_pos: Pairwise L2 distances between x and y_pos, shape (N, N_pos)
+        dist_neg: Pairwise L2 distances between x and y_neg, shape (N, N_neg)
+        y_pos: Positive samples in feature space, shape (N_pos, D)
+        y_neg: Negative samples in feature space, shape (N_neg, D)
+        temperature: Temperature for softmax (smaller = sharper)
+        mask_self: Whether to mask self-distances when y_neg starts with x
+        neg_weights: Optional non-negative weights for negative samples, shape (N_neg,)
+
+    Returns:
+        V: Drifting field, shape (N, D)
+        A_pos: Normalized affinities for positives, shape (N, N_pos)
+        A_neg: Normalized affinities for negatives, shape (N, N_neg)
+    """
+    if dist_pos.ndim != 2 or dist_neg.ndim != 2:
+        raise ValueError("dist_pos and dist_neg must be 2D tensors.")
+
+    N, N_pos = dist_pos.shape
+    N_neg = dist_neg.shape[1]
+    if y_pos.shape[0] != N_pos:
+        raise ValueError(
+            f"y_pos first dimension must match dist_pos second dimension ({N_pos}), "
+            f"got {y_pos.shape[0]}."
+        )
+    if y_neg.shape[0] != N_neg:
+        raise ValueError(
+            f"y_neg first dimension must match dist_neg second dimension ({N_neg}), "
+            f"got {y_neg.shape[0]}."
+        )
+
+    # 1) Optional self-mask on a local view/copy to avoid mutating shared dist matrices.
+    if mask_self and N_neg >= N:
+        dist_neg_local = dist_neg.clone()
+        mask = torch.eye(N, device=dist_neg.device, dtype=dist_neg.dtype) * 1e6
+        dist_neg_local[:, :N] = dist_neg_local[:, :N] + mask
+    else:
+        dist_neg_local = dist_neg
+
+    # 2) Compute logits.
+    logit_pos = -dist_pos / temperature
+    logit_neg = -dist_neg_local / temperature
+    if neg_weights is not None:
+        if neg_weights.ndim != 1 or neg_weights.shape[0] != N_neg:
+            raise ValueError(
+                f"neg_weights must have shape ({N_neg},), got {tuple(neg_weights.shape)}"
+            )
+        safe_weights = neg_weights.to(logit_neg.device).clamp_min(1e-12)
+        logit_neg = logit_neg + torch.log(safe_weights).unsqueeze(0)
+
+    # 3) Normalize over y-axis and x-axis.
+    logit = torch.cat([logit_pos, logit_neg], dim=1)
+    A_row = torch.softmax(logit, dim=1)
+    A_col = torch.softmax(logit, dim=0)
+    A = torch.sqrt(A_row * A_col)
+
+    # 4) Split into positive / negative affinities.
+    A_pos = A[:, :N_pos]
+    A_neg = A[:, N_pos:]
+
+    # 5) Cross-weighting and drift.
+    W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)
+    W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)
+    drift_pos = torch.mm(W_pos, y_pos)
+    drift_neg = torch.mm(W_neg, y_neg)
+    V = drift_pos - drift_neg
+    return V, A_pos, A_neg
+
+
 def compute_V(
     x: torch.Tensor,
     y_pos: torch.Tensor,
@@ -15,7 +95,7 @@ def compute_V(
     temperature: float,
     mask_self: bool = True,
     neg_weights: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the drifting field V (Algorithm 2 from paper, Page 12).
 
@@ -32,54 +112,17 @@ def compute_V(
     Returns:
         V: Drifting field, shape (N, D)
     """
-    N = x.shape[0]
-    N_pos = y_pos.shape[0]
-    N_neg = y_neg.shape[0]
-    device = x.device
-
-    # 1. Compute pairwise L2 distances
-    dist_pos = torch.cdist(x, y_pos, p=2)  # (N, N_pos)
-    dist_neg = torch.cdist(x, y_neg, p=2)  # (N, N_neg)
-
-    # 2. Mask self-distances when y_neg starts with x.
-    if mask_self and N_neg >= N:
-        mask = torch.eye(N, device=device) * 1e6
-        dist_neg[:, :N] = dist_neg[:, :N] + mask
-
-    # 3. Compute logits
-    logit_pos = -dist_pos / temperature  # (N, N_pos)
-    logit_neg = -dist_neg / temperature  # (N, N_neg)
-    if neg_weights is not None:
-        if neg_weights.ndim != 1 or neg_weights.shape[0] != N_neg:
-            raise ValueError(
-                f"neg_weights must have shape ({N_neg},), got {tuple(neg_weights.shape)}"
-            )
-        safe_weights = neg_weights.to(device).clamp_min(1e-12)
-        logit_neg = logit_neg + torch.log(safe_weights).unsqueeze(0)
-
-    # 4. Concat for normalization
-    logit = torch.cat([logit_pos, logit_neg], dim=1)  # (N, N_pos + N_neg)
-
-    # 5. Normalize along BOTH dimensions (key insight from paper)
-    A_row = torch.softmax(logit, dim=1)   # softmax over y (columns)
-    A_col = torch.softmax(logit, dim=0)   # softmax over x (rows)
-    A = torch.sqrt(A_row * A_col)         # geometric mean
-
-    # 6. Split back to pos and neg
-    A_pos = A[:, :N_pos]  # (N, N_pos)
-    A_neg = A[:, N_pos:]  # (N, N_neg)
-
-    # 7. Compute weights (cross-weighting from paper)
-    W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)  # (N, N_pos)
-    W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)  # (N, N_neg)
-
-    # 8. Compute drift
-    drift_pos = torch.mm(W_pos, y_pos)  # (N, D)
-    drift_neg = torch.mm(W_neg, y_neg)  # (N, D)
-
-    V = drift_pos - drift_neg
-
-    return V, A_pos, A_neg
+    dist_pos = torch.cdist(x, y_pos, p=2)
+    dist_neg = torch.cdist(x, y_neg, p=2)
+    return compute_V_from_dists(
+        dist_pos=dist_pos,
+        dist_neg=dist_neg,
+        y_pos=y_pos,
+        y_neg=y_neg,
+        temperature=temperature,
+        mask_self=mask_self,
+        neg_weights=neg_weights,
+    )
 
 
 def compute_V_multi_temperature(
@@ -112,7 +155,7 @@ def compute_V_multi_temperature(
     V_total = torch.zeros_like(x)
 
     for tau in temperatures:
-        V_tau = compute_V(
+        V_tau, _, _ = compute_V(
             x,
             y_pos,
             y_neg,
@@ -444,7 +487,7 @@ def drift_step_2d(
     Returns:
         Updated points after one drift step
     """
-    V = compute_V(
+    V, _, _ = compute_V(
         points,
         target_dist,
         points,

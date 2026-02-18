@@ -1,8 +1,3 @@
-"""
-Training script for Drifting Models on MNIST/CIFAR-10/ImageNet.
-Includes a minimal ImageNet pipeline with CFG-aware drifting loss.
-"""
-
 import argparse
 import math
 import os
@@ -11,18 +6,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torchmetrics.image.fid import FrechetInceptionDistance
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import datasets, transforms
 
-from drifting import compute_V
+from datasets.factory import get_dataset
+from drifting import compute_V_from_dists
+from utils.config import DATASET_CONFIG_FILES, get_default_config
+from utils.distributed import cleanup_distributed, reduce_info, setup_distributed
 from feature_encoder import create_feature_encoder, extract_feature_sets
 from model import DriftDiT_models
 from sample import compute_fid_score, generate_class_grid
@@ -37,127 +31,6 @@ from utils import (
     save_image_grid,
     set_seed,
 )
-
-
-DATASET_CONFIG_FILES = {
-    "mnist": "config/datasets/mnist.yaml",
-    "cifar": "config/datasets/cifar.yaml",
-    "imagenet": "config/datasets/imagenet.yaml",
-}
-
-
-def setup_distributed() -> Tuple[bool, int, int, int]:
-    """Initialize DDP if launched with torchrun."""
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        return False, 0, 1, 0
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("Distributed training requires CUDA.")
-
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    return True, rank, world_size, local_rank
-
-
-def cleanup_distributed(distributed: bool):
-    if distributed and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def get_default_config(dataset: str) -> Dict[str, Any]:
-    name = dataset.lower()
-    rel_path = DATASET_CONFIG_FILES.get(name)
-    if rel_path is None:
-        raise ValueError(f"Unsupported dataset: {dataset}")
-    config_path = Path(rel_path)
-    if not config_path.is_absolute():
-        config_path = Path(__file__).resolve().parent / config_path
-    config_path = config_path.expanduser()
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing {name} dataset config: {config_path}")
-    with config_path.open("r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    if not isinstance(config, dict):
-        raise ValueError(f"{name} dataset config must contain a mapping: {config_path}")
-    return config.copy()
-
-
-def get_dataset(
-    name: str,
-    root: str,
-    img_size: int,
-    include_eval: bool = True,
-):
-    """Create dataset objects for train/eval."""
-    name = name.lower()
-    if name == "mnist":
-        mnist_root = os.path.join(root, "mnist")
-        transform = transforms.Compose([
-            transforms.Resize(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ])
-        train_dataset = datasets.MNIST(mnist_root, train=True, download=True, transform=transform)
-        test_dataset = (
-            datasets.MNIST(mnist_root, train=False, download=True, transform=transform)
-            if include_eval
-            else None
-        )
-        return train_dataset, test_dataset
-
-    if name == "cifar":
-        transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-        test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-        train_dataset = datasets.CIFAR10(root, train=True, download=True, transform=transform)
-        test_dataset = (
-            datasets.CIFAR10(root, train=False, download=True, transform=test_transform)
-            if include_eval
-            else None
-        )
-        return train_dataset, test_dataset
-
-    if name == "imagenet":
-        train_dir = Path(root) / "train"
-        val_dir = Path(root) / "val"
-        if not train_dir.exists():
-            raise FileNotFoundError(
-                f"ImageNet expects {train_dir}. Prepare ImageFolder-style train directory first."
-            )
-        train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-        val_transform = transforms.Compose([
-            transforms.Resize(int(img_size * 256 / 224)),
-            transforms.CenterCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-        train_dataset = datasets.ImageFolder(str(train_dir), transform=train_transform)
-        if include_eval:
-            has_val_classes = val_dir.exists() and any(p.is_dir() for p in val_dir.iterdir())
-            if has_val_classes:
-                test_dataset = datasets.ImageFolder(str(val_dir), transform=val_transform)
-            else:
-                test_dataset = train_dataset
-        else:
-            test_dataset = None
-        return train_dataset, test_dataset
-
-    raise ValueError(f"Unsupported dataset: {name}")
 
 
 def sample_alpha(
@@ -256,23 +129,36 @@ def compute_drifting_loss(
                 feat_neg = feat_gen_c
                 neg_weights = None
 
-            feat_gen_n = F.normalize(feat_gen_c, p=2, dim=1)
-            feat_pos_n = F.normalize(feat_pos_c, p=2, dim=1)
-            feat_neg_n = F.normalize(feat_neg, p=2, dim=1)
+            # Reuse the same pairwise distances for A.6 feature scale and all temperatures.
+            dist_pos_raw = torch.cdist(feat_gen_c, feat_pos_c, p=2)
+            dist_neg_raw = torch.cdist(feat_gen_c, feat_neg, p=2)
+
+            with torch.no_grad():
+                # S_j = (1/sqrt(C_j)) * E[||phi_j(x)-phi_j(y)||], with stop-grad.
+                s_j = torch.cat([dist_pos_raw, dist_neg_raw], dim=1).mean()
+                s_j = s_j / math.sqrt(float(feat_gen_c.shape[-1]))
+                s_j = s_j.clamp_min(1e-6)
+
+            feat_gen_n = feat_gen_c / s_j
+            feat_pos_n = feat_pos_c / s_j
+            feat_neg_n = feat_neg / s_j
+            dist_pos = dist_pos_raw / s_j
+            dist_neg = dist_neg_raw / s_j
 
             v_total = torch.zeros_like(feat_gen_n)
             for tau in temperatures:
-                v_tau, a_pos, a_neg = compute_V(
-                    feat_gen_n,
-                    feat_pos_n,
-                    feat_neg_n,
+                v_tau, a_pos, a_neg = compute_V_from_dists(
+                    dist_pos=dist_pos,
+                    dist_neg=dist_neg,
+                    y_pos=feat_pos_n,
+                    y_neg=feat_neg_n,
                     temperature=tau,
                     mask_self=True,
                     neg_weights=neg_weights,
                 )
                 Z_pos += float(torch.mean(torch.sum(a_pos, dim=-1)).item())
                 Z_neg += float(torch.mean(torch.sum(a_neg, dim=-1)).item())
-                v_tau = v_tau / torch.sqrt(torch.mean(v_tau**2)).detach()
+                v_tau = v_tau / torch.sqrt(torch.mean(v_tau**2))
                 v_total = v_total + v_tau
 
             target = (feat_gen_n + v_total).detach()
@@ -424,30 +310,6 @@ def fill_queues(
             break
 
 
-def reduce_info(info: Dict[str, float], device: torch.device, distributed: bool, world_size: int):
-    if not distributed:
-        return info
-    keys = sorted(info.keys())
-    vec = torch.tensor([float(info[k]) for k in keys], dtype=torch.float32, device=device)
-    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
-    vec = vec / world_size
-    return {k: vec[i].item() for i, k in enumerate(keys)}
-
-def maybe_init_wandb(args, config: Dict[str, Any], is_main: bool):
-    if not args.wandb or not is_main:
-        return None
-    key_file = Path(args.wandb_key_file) if args.wandb_key_file else None
-    if key_file and key_file.exists() and "WANDB_API_KEY" not in os.environ:
-        os.environ["WANDB_API_KEY"] = key_file.read_text().strip()
-
-    run = wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config=config,
-    )
-    return run
-
-
 def train(args):
     distributed, rank, world_size, local_rank = setup_distributed()
     is_main = rank == 0
@@ -462,6 +324,12 @@ def train(args):
 
     config = get_default_config(args.dataset)
     config["dataset"] = args.dataset.lower()
+    if args.feature_encoder_arch is not None:
+        config["feature_encoder_arch"] = args.feature_encoder_arch
+    if args.feature_encoder_path is not None:
+        config["feature_encoder_path"] = args.feature_encoder_path
+    if args.vae_path is not None:
+        config["vae_path"] = args.vae_path
 
     # Ensure queues can satisfy per-step sampling requirements.
     if config["queue_size"] < config["batch_n_pos"]:
@@ -538,10 +406,39 @@ def train(args):
             multi_scale=True,
             use_pretrained=True,
             pretrained_arch=config["feature_encoder_arch"],
+            pretrained_path=config.get("feature_encoder_path"),
         ).to(device)
         feature_encoder.eval()
         for p in feature_encoder.parameters():
             p.requires_grad = False
+
+    vae_decoder: Optional[nn.Module] = None
+    if config["use_feature_encoder"] and feature_encoder is not None:
+        encoder_channels = int(getattr(feature_encoder, "expected_in_channels", config["in_channels"]))
+        if encoder_channels != config["in_channels"]:
+            if config["in_channels"] != 4 or encoder_channels != 3:
+                raise ValueError(
+                    "Unsupported channel setup for feature extraction: "
+                    f"model in_channels={config['in_channels']}, "
+                    f"feature encoder in_channels={encoder_channels}."
+                )
+            vae_path = config.get("vae_path")
+            if not vae_path:
+                raise ValueError(
+                    "Model outputs 4-channel latents but feature encoder expects RGB. "
+                    "Please set `vae_path` in config or pass `--vae_path`."
+                )
+            if is_main:
+                print(f"Loading VAE decoder from: {vae_path}")
+            from diffusers import AutoencoderKL
+            vae_decoder = AutoencoderKL.from_pretrained(
+                vae_path,
+                local_files_only=True,
+                use_safetensors=True,
+            ).to(device)
+            vae_decoder.eval()
+            for p in vae_decoder.parameters():
+                p.requires_grad = False
 
     ema = EMA(model, decay=config["ema_decay"])
     optimizer = torch.optim.AdamW(
@@ -578,7 +475,17 @@ def train(args):
         if is_main:
             print(f"Resumed from epoch {start_epoch}, step {global_step}")
 
-    wandb_run = maybe_init_wandb(args, config, is_main)
+    wandb_run = None
+    if args.wandb and is_main:
+        key_file = Path(args.wandb_key_file) if args.wandb_key_file else None
+        if key_file and key_file.exists() and "WANDB_API_KEY" not in os.environ:
+            os.environ["WANDB_API_KEY"] = key_file.read_text().strip()
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=config,
+        )
     fid_real_images: Optional[torch.Tensor] = None
     if is_main and wandb_run is not None and args.wandb_fid_interval > 0:
         fid_workers = max(0, args.fid_num_workers)
@@ -661,6 +568,7 @@ def train(args):
                 config=config,
                 device=device,
                 feature_encoder=feature_encoder,
+                vae_decoder=vae_decoder,
             )
             if info is None:
                 continue
@@ -822,6 +730,24 @@ def main():
         type=int,
         default=2,
         help="Number of dataloader workers used for FID real-image loader.",
+    )
+    parser.add_argument(
+        "--feature_encoder_arch",
+        type=str,
+        default=None,
+        help="Optional override for feature encoder architecture.",
+    )
+    parser.add_argument(
+        "--feature_encoder_path",
+        type=str,
+        default=None,
+        help="Optional local path/name for feature encoder weights.",
+    )
+    parser.add_argument(
+        "--vae_path",
+        type=str,
+        default=None,
+        help="Optional local path for SD-VAE decoder when model outputs latents.",
     )
     args = parser.parse_args()
     train(args)
