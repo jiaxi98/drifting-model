@@ -19,9 +19,11 @@ epochs: 100
 alpha_min: 1.0
 alpha_max: 4.0
 alpha_sampling: power
-alpha_power: 3.0
+alpha_power: 5.0
 use_feature_encoder: true
-feature_encoder_arch: resnet50
+feature_encoder_arch: convnextv2-large
+feature_encoder_path: checkpoints/encoders/convnextv2-large-22k-224
+vae_path: checkpoints/vae/sd-vae-ft-mse
 queue_size: 32
 uncond_queue_size: 256
 label_dropout: 0.1
