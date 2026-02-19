@@ -19,7 +19,7 @@ from utils.config import DATASET_CONFIG_FILES, get_default_config
 from utils.distributed import cleanup_distributed, reduce_info, setup_distributed
 from feature_encoder import create_feature_encoder, extract_feature_fullsets, extract_feature_sets
 from model import DriftDiT_models
-from sample import compute_fid_score, compute_is_score, generate_class_grid
+from eval import compute_fid_score, compute_is_score, generate_class_grid
 from utils import (
     EMA,
     GlobalSampleQueue,
@@ -402,6 +402,7 @@ def train(args):
         in_channels=config["in_channels"],
         num_classes=config["num_classes"],
         label_dropout=config["label_dropout"],
+        use_gradient_checkpointing=args.grad_checkpointing,
     ).to(device)
     model_for_train: nn.Module = model
     if distributed:
@@ -723,6 +724,12 @@ def main():
     parser.add_argument("--preview_alpha", type=float, default=1.5)
 
     parser.add_argument("--amp", action="store_true", default=False)
+    parser.add_argument(
+        "--grad_checkpointing",
+        action="store_true",
+        default=False,
+        help="Enable gradient checkpointing for transformer blocks to reduce activation memory.",
+    )
     parser.add_argument("--wandb", action="store_true", default=False)
     parser.add_argument(
         "--wandb_project",

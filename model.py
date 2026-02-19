@@ -12,6 +12,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple
 from einops import rearrange
 
@@ -365,6 +366,7 @@ class DriftDiT(nn.Module):
         label_dropout: float = 0.1,
         num_register_tokens: int = 16,
         use_style_embed: bool = True,
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         if img_size % patch_size != 0:
@@ -381,6 +383,7 @@ class DriftDiT(nn.Module):
         self.depth = depth
         self.num_heads = num_heads
         self.num_patches = (img_size // patch_size) ** 2
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Patch embedding
         self.patch_embed = PatchEmbed(
@@ -510,7 +513,17 @@ class DriftDiT(nn.Module):
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x, c, rope_cos, rope_sin)
+            if self.training and self.use_gradient_checkpointing and x.requires_grad:
+                x = checkpoint(
+                    block,
+                    x,
+                    c,
+                    rope_cos,
+                    rope_sin,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, c, rope_cos, rope_sin)
 
         # Remove register tokens
         x = x[:, self.num_register_tokens:, :]
