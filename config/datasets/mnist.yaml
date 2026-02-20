@@ -3,8 +3,8 @@ img_size: 32
 in_channels: 1
 num_classes: 10
 batch_nc: 10
-batch_n_pos: 32
-batch_n_neg: 32
+batch_n_pos: 256
+batch_n_neg: 256
 batch_n_uncond: 0
 temperatures:
   - 0.02

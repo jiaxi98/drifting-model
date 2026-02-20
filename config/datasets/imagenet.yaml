@@ -2,9 +2,9 @@ model: DriftDiT-B16
 img_size: 256
 in_channels: 3
 num_classes: 1000
-batch_nc: 128
+batch_nc: 8
 batch_n_pos: 32
-batch_n_neg: 8
+batch_n_neg: 32
 batch_n_uncond: 32
 temperatures:
   - 0.02
