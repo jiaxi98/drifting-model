@@ -22,6 +22,7 @@ alpha_sampling: uniform
 alpha_power: 3.0
 use_feature_encoder: false
 feature_encoder_arch: resnet18
+kernel: gaussian # l2 | gaussian
 queue_size: 32
 uncond_queue_size: 256
 label_dropout: 0.1

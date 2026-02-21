@@ -14,7 +14,7 @@ lr: 0.0002
 weight_decay: 0.01
 grad_clip: 2.0
 ema_decay: 0.999
-warmup_steps: 2000
+warmup_steps: 500
 epochs: 200
 alpha_min: 1.0
 alpha_max: 3.0
@@ -23,6 +23,7 @@ alpha_power: 3.0
 use_feature_encoder: true
 use_full_feature_set: true
 feature_encoder_arch: resnet18
+kernel: l2 # l2 | gaussian
 queue_size: 128
 uncond_queue_size: 256
 label_dropout: 0.1

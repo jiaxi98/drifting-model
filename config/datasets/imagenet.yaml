@@ -24,6 +24,7 @@ use_feature_encoder: true
 feature_encoder_arch: convnextv2-large
 feature_encoder_path: checkpoints/encoders/convnextv2-large-22k-224
 vae_path: checkpoints/vae/sd-vae-ft-mse
+kernel: l2 # l2 | gaussian
 queue_size: 32
 uncond_queue_size: 256
 label_dropout: 0.1

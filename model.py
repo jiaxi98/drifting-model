@@ -367,6 +367,7 @@ class DriftDiT(nn.Module):
         num_register_tokens: int = 16,
         use_style_embed: bool = True,
         use_gradient_checkpointing: bool = False,
+        grad_ckpt_every_n_blocks: int = 1,
     ):
         super().__init__()
         if img_size % patch_size != 0:
@@ -384,6 +385,7 @@ class DriftDiT(nn.Module):
         self.num_heads = num_heads
         self.num_patches = (img_size // patch_size) ** 2
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.grad_ckpt_every_n_blocks = max(1, grad_ckpt_every_n_blocks)
 
         # Patch embedding
         self.patch_embed = PatchEmbed(
@@ -512,8 +514,14 @@ class DriftDiT(nn.Module):
             c = c + self.style_embed(B, device, indices=style_indices)
 
         # Transformer blocks
-        for block in self.blocks:
-            if self.training and self.use_gradient_checkpointing and x.requires_grad:
+        for block_idx, block in enumerate(self.blocks):
+            use_checkpoint = (
+                self.training
+                and self.use_gradient_checkpointing
+                and x.requires_grad
+                and (block_idx % self.grad_ckpt_every_n_blocks == 0)
+            )
+            if use_checkpoint:
                 x = checkpoint(
                     block,
                     x,
@@ -521,6 +529,7 @@ class DriftDiT(nn.Module):
                     rope_cos,
                     rope_sin,
                     use_reentrant=False,
+                    preserve_rng_state=False,
                 )
             else:
                 x = block(x, c, rope_cos, rope_sin)

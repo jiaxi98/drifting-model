@@ -5,11 +5,14 @@ Includes FID computation and sample generation utilities.
 
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+from torch.utils.data import DataLoader, Subset
 
 from model import DriftDiT_models
 from utils import (
@@ -147,6 +150,115 @@ def generate_alpha_sweep(
         samples.append(x)
 
     return torch.cat(samples, dim=0).clamp(-1, 1), alphas
+
+
+def _is_distributed(distributed: bool) -> bool:
+    return distributed and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+def split_count_by_rank(total: int, rank: int, world_size: int) -> Tuple[int, int]:
+    """Return (start_idx, local_count) after evenly splitting total across ranks."""
+    base = total // world_size
+    rem = total % world_size
+    local_count = base + (1 if rank < rem else 0)
+    start_idx = rank * base + min(rank, rem)
+    return start_idx, local_count
+
+
+def _prepare_inception_input(images: torch.Tensor, in_channels: int) -> torch.Tensor:
+    """Convert normalized model images to Inception-ready RGB tensors."""
+    x = (images + 1.0) / 2.0
+    if in_channels == 1:
+        x = x.repeat(1, 3, 1, 1)
+    elif in_channels != 3:
+        raise ValueError(
+            f"Inception-based FID/IS expects 1 or 3 channels, but got in_channels={in_channels}."
+        )
+    x = F.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
+    return x.clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def compute_fid_is_distributed(
+    model: nn.Module,
+    test_dataset,
+    in_channels: int,
+    img_size: int,
+    num_classes: int,
+    device: torch.device,
+    num_samples: int = 10000,
+    batch_size: int = 256,
+    num_workers: int = 2,
+    alpha: float = 1.5,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> Tuple[float, float, float]:
+    """
+    Distributed FID/IS with torchmetrics (same path as single-GPU eval).
+    Each rank updates metrics with its local shard; torchmetrics synchronizes on compute().
+    """
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    from torchmetrics.image.inception import InceptionScore
+
+    if test_dataset is None or num_samples <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    is_metric = InceptionScore(normalize=True).to(device)
+    model.eval()
+
+    local_start, local_count = split_count_by_rank(num_samples, rank, world_size)
+    if local_count <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    dataset_len = len(test_dataset)
+    if dataset_len <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    # Update real-image stats from this rank's shard.
+    real_indices = [(local_start + i) % dataset_len for i in range(local_count)]
+    real_subset = Subset(test_dataset, real_indices)
+    worker_count = max(0, num_workers)
+    real_loader = DataLoader(
+        real_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=worker_count,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        persistent_workers=worker_count > 0,
+    )
+    for batch in real_loader:
+        images = batch[0] if isinstance(batch, (list, tuple)) else batch
+        images = images.to(device, non_blocking=True)
+        real_inputs = _prepare_inception_input(images, in_channels=in_channels)
+        fid_metric.update(real_inputs, real=True)
+
+    # Update fake-image stats / logits from this rank's shard.
+    generated = 0
+    while generated < local_count:
+        current_batch = min(batch_size, local_count - generated)
+        samples = generate_samples(
+            model=model,
+            num_samples=current_batch,
+            in_channels=in_channels,
+            img_size=img_size,
+            num_classes=num_classes,
+            device=device,
+            alpha=alpha,
+        )
+        fake_inputs = _prepare_inception_input(samples, in_channels=in_channels)
+        fid_metric.update(fake_inputs, real=False)
+        is_metric.update(fake_inputs)
+        generated += current_batch
+
+    if _is_distributed(distributed):
+        dist.barrier()
+
+    fid_score = float(fid_metric.compute().item())
+    is_mean, is_std = is_metric.compute()
+    return fid_score, float(is_mean.item()), float(is_std.item())
 
 
 def compute_fid_score(

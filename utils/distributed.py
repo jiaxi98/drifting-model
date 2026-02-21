@@ -20,7 +20,11 @@ def setup_distributed() -> Tuple[bool, int, int, int]:
         raise RuntimeError("Distributed training requires CUDA.")
 
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+    )
     return True, rank, world_size, local_rank
 
 
