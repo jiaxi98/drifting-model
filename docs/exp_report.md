@@ -1,9 +1,6 @@
 # Experiment report for paper: Generative Modeling via Drifting
 We ran preliminary experiments on MNIST and CIFAR with our extended implementation ([repo](https://github.com/jiaxi98/drifting-model)). So far, the results are still far from the paper-level quality, especially on final FID.
 
-## Baseline sanity
-Training/sampling/FID/IS pipelines are functional. We can reproduce stable training runs and collect all metrics in W&B, but visual quality and FID remain unsatisfactory.
-
 ## Batch size of positive and negative samples
 We tested the effect of Monte Carlo sample size by sweeping `batch_n_pos=batch_n_neg` on MNIST, with all other settings fixed (single seed for now).
 
@@ -23,10 +20,19 @@ Observations:
 - `train/loss` reaches a low value early, then rises and plateaus instead of monotonically decreasing.
 - IS peaks early and then declines at later training stages.
 
-### Curves (downloaded from W&B history)
-![MNIST batch sweep loss](figures/mnist_bs_sweep_loss.png)
-![MNIST batch sweep FID](figures/mnist_bs_sweep_fid.png)
-![MNIST batch sweep IS](figures/mnist_bs_sweep_is.png)
+### Curves + final sample (downloaded from W&B history)
+`bs128` run (`7m73idae`), final sample is from step `23000`.
+
+<table>
+  <tr>
+    <td><img src="figures/mnist_bs_sweep_loss.png" alt="MNIST batch sweep loss" width="100%"></td>
+    <td><img src="figures/mnist_bs_sweep_fid.png" alt="MNIST batch sweep FID" width="100%"></td>
+  </tr>
+  <tr>
+    <td><img src="figures/mnist_bs_sweep_is.png" alt="MNIST batch sweep IS" width="100%"></td>
+    <td><img src="figures/mnist_bs128_step23000.png" alt="MNIST bs128 final sample grid at step 23000" width="100%"></td>
+  </tr>
+</table>
 
 ## Kernel choices
 We investigate different kernels for drift estimation. The paper uses L2 kernel. We also evaluate Gaussian kernel as an alternative with a stronger theoretical motivation (Fisher-information-related objective under our derivation).

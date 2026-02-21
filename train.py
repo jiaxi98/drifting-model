@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
@@ -19,7 +20,10 @@ from utils.config import DATASET_CONFIG_FILES, get_default_config
 from utils.distributed import cleanup_distributed, reduce_info, setup_distributed
 from feature_encoder import create_feature_encoder, extract_feature_fullsets, extract_feature_sets
 from model import DriftDiT_models
-from eval import compute_fid_score, compute_is_score, generate_class_grid
+from eval import (
+    compute_fid_is_distributed,
+    generate_class_grid,
+)
 from utils import (
     EMA,
     GlobalSampleQueue,
@@ -84,13 +88,22 @@ def compute_drifting_loss(
     feature_encoder: Optional[nn.Module],
     vae_decoder: Optional[nn.Module],
     temperatures: List[float],
+    kernel: str,
     n_neg: int,
     n_uncond: int,
     use_pixel_space: bool,
     use_full_feature_set: bool = False,
+    profile_timing: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """CFG-aware drifting loss (minimal implementation)."""
     device = x_gen.device
+
+    feature_sets_time = 0.0
+    drift_compute_time = 0.0
+    if profile_timing:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        feature_t0 = time.perf_counter()
 
     feature_fn = extract_feature_fullsets if use_full_feature_set else extract_feature_sets
     feat_gen_list = feature_fn(x_gen, feature_encoder, vae_decoder, use_pixel_space)
@@ -100,6 +113,13 @@ def compute_drifting_loss(
         if x_uncond is not None
         else []
     )
+    if profile_timing:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        feature_sets_time = time.perf_counter() - feature_t0
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        drift_t0 = time.perf_counter()
 
     total_loss = torch.tensor(0.0, device=device)
     Z_pos = 0.0
@@ -156,15 +176,23 @@ def compute_drifting_loss(
             feat_neg_n = feat_neg / s_j
             dist_pos = dist_pos_raw / s_j
             dist_neg = dist_neg_raw / s_j
+            if kernel == "l2":
+                scale = math.sqrt(c_j)
+                dist_pos_k = dist_pos
+                dist_neg_k = dist_neg
+            elif kernel == "gaussian":
+                scale = 2 * c_j
+                dist_pos_k = dist_pos.square()
+                dist_neg_k = dist_neg.square()
 
             v_total = torch.zeros_like(feat_gen_n)
             for tau in temperatures:
                 v_tau, a_pos, a_neg = compute_V_from_dists(
-                    dist_pos=dist_pos,
-                    dist_neg=dist_neg,
+                    dist_pos=dist_pos_k,
+                    dist_neg=dist_neg_k,
                     y_pos=feat_pos_n,
                     y_neg=feat_neg_n,
-                    temperature=tau * math.sqrt(c_j),
+                    temperature=tau * scale,
                     mask_self=True,
                     neg_weights=neg_weights,
                 )
@@ -175,7 +203,6 @@ def compute_drifting_loss(
                 v_total = v_total + v_tau
 
             target = (feat_gen_n + v_total).detach()
-            # NOTE: loss term is consistent with normalization of v_tau
             loss_term = F.mse_loss(feat_gen_n, target)
             total_loss = total_loss + loss_term
             n_terms += 1
@@ -183,14 +210,30 @@ def compute_drifting_loss(
     if n_terms == 0:
         # Keep graph valid for backward while avoiding divide-by-zero.
         zero_loss = x_gen.sum() * 0.0
-        return zero_loss, {"loss": 0.0, "Z_pos": 0.0, "Z_neg": 0.0}
+        info = {"loss": 0.0, "Z_pos": 0.0, "Z_neg": 0.0}
+        if profile_timing:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            drift_compute_time = time.perf_counter() - drift_t0
+            info["feature_sets_time_s"] = feature_sets_time
+            info["drift_compute_time_s"] = drift_compute_time
+            info["loss_compute_time_s"] = feature_sets_time + drift_compute_time
+        return zero_loss, info
 
+    if profile_timing:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        drift_compute_time = time.perf_counter() - drift_t0
     loss = total_loss / n_terms
     info = {
         "loss": float(loss.item()),
         "Z_pos": Z_pos / n_terms,
         "Z_neg": Z_neg / n_terms,
     }
+    if profile_timing:
+        info["feature_sets_time_s"] = feature_sets_time
+        info["drift_compute_time_s"] = drift_compute_time
+        info["loss_compute_time_s"] = feature_sets_time + drift_compute_time
     return loss, info
 
 
@@ -207,6 +250,7 @@ def train_step(
     device: torch.device,
     feature_encoder: Optional[nn.Module],
     vae_decoder: Optional[nn.Module] = None,
+    profile_timing: bool = False,
 ) -> Optional[Dict[str, float]]:
     """Run one optimization step. Returns None if queues are not ready."""
     if not class_queue.is_ready(config["batch_n_pos"]):
@@ -219,6 +263,15 @@ def train_step(
     n_pos = config["batch_n_pos"]
     n_neg = config["batch_n_neg"]
     n_uncond = config["batch_n_uncond"]
+    step_time = 0.0
+    queue_sample_time = 0.0
+    neg_sample_gen_time = 0.0
+    backward_opt_time = 0.0
+    if profile_timing and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        step_t0 = time.perf_counter()
+    elif profile_timing:
+        step_t0 = time.perf_counter()
 
     if batch_nc <= config["num_classes"]:
         class_labels = torch.randperm(config["num_classes"], device=device)[:batch_nc]
@@ -234,6 +287,11 @@ def train_step(
     )
     labels_gen = class_labels.repeat_interleave(n_neg)
     alpha_gen = class_alphas.repeat_interleave(n_neg)
+    if profile_timing and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        queue_t0 = time.perf_counter()
+    elif profile_timing:
+        queue_t0 = time.perf_counter()
     x_pos_list = []
     y_pos_list = []
     for c in class_labels.tolist():
@@ -248,6 +306,10 @@ def train_step(
         if n_uncond > 0 and uncond_queue is not None
         else None
     )
+    if profile_timing:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        queue_sample_time = time.perf_counter() - queue_t0
 
     noise = torch.randn(
         labels_gen.shape[0],
@@ -259,7 +321,16 @@ def train_step(
 
     optimizer.zero_grad(set_to_none=True)
     with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+        if profile_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+            neg_gen_t0 = time.perf_counter()
+        elif profile_timing:
+            neg_gen_t0 = time.perf_counter()
         x_gen = model_for_train(noise, labels_gen, alpha_gen)
+        if profile_timing:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            neg_sample_gen_time = time.perf_counter() - neg_gen_t0
         loss, info = compute_drifting_loss(
             x_gen=x_gen,
             labels_gen=labels_gen,
@@ -271,12 +342,19 @@ def train_step(
             feature_encoder=feature_encoder,
             vae_decoder=vae_decoder,
             temperatures=config["temperatures"],
+            kernel=config["kernel"],
             n_neg=n_neg,
             n_uncond=n_uncond,
             use_pixel_space=not config["use_feature_encoder"],
             use_full_feature_set=bool(config.get("use_full_feature_set", False)),
+            profile_timing=profile_timing,
         )
 
+    if profile_timing and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        backward_t0 = time.perf_counter()
+    elif profile_timing:
+        backward_t0 = time.perf_counter()
     if scaler.is_enabled():
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -287,6 +365,10 @@ def train_step(
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
         optimizer.step()
+    if profile_timing:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        backward_opt_time = time.perf_counter() - backward_t0
 
     info["grad_norm"] = float(grad_norm.item())
     # Alpha diagnostics for sampled class-level CFG strengths.
@@ -294,6 +376,14 @@ def train_step(
     info["alpha_std"] = float(class_alphas.std(unbiased=False).item())
     info["alpha_min"] = float(class_alphas.min().item())
     info["alpha_max"] = float(class_alphas.max().item())
+    if profile_timing:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        step_time = time.perf_counter() - step_t0
+        info["step_time_s"] = step_time
+        info["queue_sample_time_s"] = queue_sample_time
+        info["neg_sample_gen_time_s"] = neg_sample_gen_time
+        info["backward_opt_time_s"] = backward_opt_time
 
     ema.update(model)
     scheduler.step()
@@ -338,12 +428,20 @@ def train(args):
 
     config = get_default_config(args.dataset)
     config["dataset"] = args.dataset.lower()
+    config.setdefault("kernel", "l2")
+    if config["kernel"] not in {"l2", "gaussian"}:
+        raise ValueError(
+            f"Unsupported kernel in config: {config['kernel']}. "
+            "Expected one of: l2, gaussian."
+        )
     if args.feature_encoder_arch is not None:
         config["feature_encoder_arch"] = args.feature_encoder_arch
     if args.feature_encoder_path is not None:
         config["feature_encoder_path"] = args.feature_encoder_path
     if args.vae_path is not None:
         config["vae_path"] = args.vae_path
+    if args.grad_ckpt_every_n_blocks < 1:
+        raise ValueError("--grad_ckpt_every_n_blocks must be >= 1.")
 
     # Ensure queues can satisfy per-step sampling requirements.
     if config["queue_size"] < config["batch_n_pos"]:
@@ -359,7 +457,7 @@ def train(args):
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    need_eval_dataset = is_main and args.wandb and args.wandb_fid_interval > 0
+    need_eval_dataset = args.wandb and args.wandb_fid_interval > 0
     train_dataset, test_dataset = get_dataset(
         config["dataset"],
         root=args.data_root,
@@ -403,6 +501,7 @@ def train(args):
         num_classes=config["num_classes"],
         label_dropout=config["label_dropout"],
         use_gradient_checkpointing=args.grad_checkpointing,
+        grad_ckpt_every_n_blocks=args.grad_ckpt_every_n_blocks,
     ).to(device)
     model_for_train: nn.Module = model
     if distributed:
@@ -410,6 +509,13 @@ def train(args):
 
     if is_main:
         print(f"Model: {config['model']}, Parameters: {count_parameters(model):,}")
+        if args.grad_checkpointing:
+            print(
+                "Gradient checkpointing: enabled "
+                f"(every {args.grad_ckpt_every_n_blocks} blocks)."
+            )
+        else:
+            print("Gradient checkpointing: disabled.")
 
     feature_encoder = None
     if config["use_feature_encoder"]:
@@ -501,38 +607,22 @@ def train(args):
             name=args.wandb_run_name,
             config=config,
         )
-    fid_real_images: Optional[torch.Tensor] = None
-    if is_main and wandb_run is not None and args.wandb_fid_interval > 0:
-        fid_workers = max(0, args.fid_num_workers)
-        fid_loader = DataLoader(
-            test_dataset,
-            batch_size=args.fid_batch_size,
-            shuffle=True,
-            num_workers=fid_workers,
-            pin_memory=True,
-            drop_last=False,
-            persistent_workers=fid_workers > 0,
-        )
-        real_batches = []
-        real_count = 0
-        for batch in fid_loader:
-            if isinstance(batch, (list, tuple)):
-                x_real = batch[0]
-            else:
-                x_real = batch
-            remaining = args.fid_num_samples - real_count
-            if remaining <= 0:
-                break
-            if x_real.shape[0] > remaining:
-                x_real = x_real[:remaining]
-            real_batches.append(x_real.cpu())
-            real_count += int(x_real.shape[0])
-            if real_count >= args.fid_num_samples:
-                break
-        if real_batches:
-            fid_real_images = torch.cat(real_batches, dim=0)
-        else:
-            print("No real images collected for FID; disabling FID logging.")
+    eval_enabled = args.wandb and args.wandb_fid_interval > 0
+    if eval_enabled:
+        if test_dataset is None:
+            if is_main:
+                print("Eval dataset unavailable; disabling FID/IS logging.")
+            eval_enabled = False
+        elif is_main:
+            print(
+                "Distributed FID/IS enabled via torchmetrics "
+                f"(num_samples={args.fid_num_samples}, batch_size={args.fid_batch_size})."
+            )
+
+    if distributed:
+        enabled_tensor = torch.tensor(1 if eval_enabled else 0, dtype=torch.int64, device=device)
+        dist.all_reduce(enabled_tensor, op=dist.ReduceOp.MIN)
+        eval_enabled = bool(int(enabled_tensor.item()))
 
     if is_main:
         print(f"Starting training for {config['epochs']} epochs...")
@@ -584,6 +674,7 @@ def train(args):
                 device=device,
                 feature_encoder=feature_encoder,
                 vae_decoder=vae_decoder,
+                profile_timing=args.profile_timing,
             )
             if info is None:
                 continue
@@ -615,43 +706,50 @@ def train(args):
                     for key in ("alpha_mean", "alpha_std", "alpha_min", "alpha_max"):
                         if key in info:
                             train_payload[f"train/{key}"] = info[key]
+                    timing_key_map = {
+                        "step_time_s": "timing/step_s",
+                        "neg_sample_gen_time_s": "timing/negative_gen_s",
+                        "feature_sets_time_s": "timing/feature_sets_s",
+                        "loss_compute_time_s": "timing/loss_compute_s",
+                        "drift_compute_time_s": "timing/drift_compute_s",
+                        "queue_sample_time_s": "timing/queue_sample_s",
+                        "backward_opt_time_s": "timing/backward_opt_s",
+                    }
+                    for src_key, log_key in timing_key_map.items():
+                        if src_key in info:
+                            train_payload[log_key] = info[src_key]
 
                     wandb_run.log(train_payload, step=global_step)
             if (
-                is_main
-                and wandb_run is not None
-                and fid_real_images is not None
+                eval_enabled
+                and test_dataset is not None
                 and args.wandb_fid_interval > 0
                 and global_step % args.wandb_fid_interval == 0
             ):
-                fid_score = compute_fid_score(
+                fid_score, is_mean, is_std = compute_fid_is_distributed(
                     model=ema.shadow,
-                    real_images=fid_real_images,
+                    test_dataset=test_dataset,
                     in_channels=config["in_channels"],
                     img_size=config["img_size"],
                     num_classes=max(1, config["num_classes"]),
                     device=device,
                     num_samples=args.fid_num_samples,
                     batch_size=args.fid_batch_size,
+                    num_workers=args.fid_num_workers,
                     alpha=args.preview_alpha,
+                    distributed=distributed,
+                    rank=rank,
+                    world_size=world_size,
                 )
-                if math.isfinite(fid_score):
-                    print(f"Step {global_step} | FID: {fid_score:.4f}")
-                    wandb_run.log({"eval/fid": fid_score}, step=global_step)
-
-                is_mean, is_std = compute_is_score(
-                    model=ema.shadow,
-                    in_channels=config["in_channels"],
-                    img_size=config["img_size"],
-                    num_classes=max(1, config["num_classes"]),
-                    device=device,
-                    num_samples=args.fid_num_samples,
-                    batch_size=args.fid_batch_size,
-                    alpha=args.preview_alpha,
-                )
-                if math.isfinite(is_mean) and math.isfinite(is_std):
-                    print(f"Step {global_step} | IS: {is_mean:.4f} ± {is_std:.4f}")
-                    wandb_run.log({"eval/is": is_mean, "eval/is_std": is_std}, step=global_step)
+                if is_main and wandb_run is not None:
+                    if math.isfinite(fid_score):
+                        print(f"Step {global_step} | FID: {fid_score:.4f}")
+                        wandb_run.log({"eval/fid": fid_score}, step=global_step)
+                    if math.isfinite(is_mean) and math.isfinite(is_std):
+                        print(f"Step {global_step} | IS: {is_mean:.4f} ± {is_std:.4f}")
+                        wandb_run.log({"eval/is": is_mean, "eval/is_std": is_std}, step=global_step)
+                if distributed:
+                    dist.barrier()
 
             if is_main and args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0:
                 sample_path = output_dir / f"samples_step{global_step}.png"
@@ -730,6 +828,21 @@ def main():
         default=False,
         help="Enable gradient checkpointing for transformer blocks to reduce activation memory.",
     )
+    parser.add_argument(
+        "--grad_ckpt_every_n_blocks",
+        type=int,
+        default=1,
+        help=(
+            "Apply gradient checkpointing every N transformer blocks "
+            "(1 means checkpoint every block)."
+        ),
+    )
+    parser.add_argument(
+        "--profile_timing",
+        action="store_true",
+        default=False,
+        help="Log synchronized per-step timing metrics to W&B.",
+    )
     parser.add_argument("--wandb", action="store_true", default=False)
     parser.add_argument(
         "--wandb_project",
@@ -751,7 +864,7 @@ def main():
     parser.add_argument(
         "--fid_num_samples",
         type=int,
-        default=1000,
+        default=4096,
         help="Number of real/fake samples used per FID evaluation.",
     )
     parser.add_argument(

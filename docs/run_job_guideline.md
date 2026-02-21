@@ -88,3 +88,21 @@ CUDA_VISIBLE_DEVICES=1 python train.py --dataset cifar --output_dir outputs/cifa
   - `batch_n_pos`: positive samples per selected class in drifting loss
   - `batch_n_neg`: generated/negative samples per selected class in drifting loss
   - Quick check command: `rg -n "loader_batch_size|batch_n_pos|batch_n_neg" config/datasets/*.yaml`
+- Symptom: Long run disappears without Python traceback, and logs/checkpoints are hard to map back to the intended job
+  Cause: Job launched from interactive shell (not tmux), or run/session/log names are ad-hoc and inconsistent.
+  Action: Always launch in tmux with deterministic naming:
+  - `RUN_NAME="<dataset>_<key_settings>_$(date +%Y%m%d_%H%M%S)"`
+  - `SESSION="${RUN_NAME}_tmux"`
+  - `LOG_FILE="logs/${RUN_NAME}.log"`
+  - `OUT_DIR="outputs/<exp_dir>"`
+- Use the following arguments:
+  ```
+  --wandb_fid_interval 10 \
+  --log_interval 1
+  ```
+- If using gradient checkpointing, tune recompute cost with:
+  ```
+  --grad_checkpointing \
+  --grad_ckpt_every_n_blocks 2
+  ```
+  `1` means checkpoint every transformer block; larger values checkpoint fewer blocks (faster, more memory).
