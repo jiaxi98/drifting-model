@@ -119,3 +119,44 @@ Observations:
 
 ## Feature extractor
 We believe feature quality is a key factor for drift-model performance. Current reproduction quality is not enough yet; feature extractor choices and alignment with paper settings remain a major open factor.
+
+## Planned next experiments
+To better explain the current quality gap, we will run the following three targeted ablations next.
+
+### 1) Kernel normalization ablation (highest priority)
+Motivation: the paper (Table 11) studies kernel normalization variants, while our current implementation uses softmax over both `x` and `y` axes by default.
+
+Plan:
+- Implement a `y-only` normalization path in `compute_V_from_dists` (normalize only across `y_pos` / `y_neg` samples per generated sample).
+- Compare three variants under the same training budget:
+  - `x+y` softmax (current default)
+  - `y-only` softmax (closer to the original kernel weighting form)
+  - no normalization
+- Report `train/loss`, FID, IS, and final sample grids.
+
+### 2) Feature encoder family ablation
+Motivation: Table 3 and Appendix A.4 indicate feature encoder quality strongly affects final FID.
+
+Plan:
+- Keep training config fixed and compare:
+  - `resnet18`
+  - `resnet50`
+  - `convnextv2`
+  - `dinov2`
+- Track convergence speed, FID/IS trajectory, and final quality.
+- Highlight mismatch vs paper settings (paper uses stronger SSL encoders, including MAE-based encoders).
+
+### 3) Feature-space vs pixel-space ablation
+Motivation: this may be a major source of the gap to paper-level quality.
+
+Plan:
+- Run matched experiments on MNIST/CIFAR with:
+  - pixel-space drifting loss
+  - feature-space drifting loss
+- Keep model, optimizer, and sampling/eval budget fixed.
+- Compare loss behavior, FID/IS, and visual quality at matched steps.
+
+### Shared protocol for the three ablations
+- Fix dataset split, training steps, eval cadence, and `fid_num_samples`.
+- Use the same logging keys and save sample grids at matched steps.
+- Prefer at least 2 seeds if compute budget allows; otherwise clearly label single-seed conclusions as preliminary.

@@ -89,6 +89,7 @@ def compute_drifting_loss(
     vae_decoder: Optional[nn.Module],
     temperatures: List[float],
     kernel: str,
+    kernel_normalization: str,
     n_neg: int,
     n_uncond: int,
     use_pixel_space: bool,
@@ -195,6 +196,7 @@ def compute_drifting_loss(
                     temperature=tau * scale,
                     mask_self=True,
                     neg_weights=neg_weights,
+                    normalization=kernel_normalization,
                 )
                 Z_pos += float(torch.mean(torch.sum(a_pos, dim=-1)).item())
                 Z_neg += float(torch.mean(torch.sum(a_neg, dim=-1)).item())
@@ -343,6 +345,7 @@ def train_step(
             vae_decoder=vae_decoder,
             temperatures=config["temperatures"],
             kernel=config["kernel"],
+            kernel_normalization=config["kernel_normalization"],
             n_neg=n_neg,
             n_uncond=n_uncond,
             use_pixel_space=not config["use_feature_encoder"],
@@ -429,10 +432,18 @@ def train(args):
     config = get_default_config(args.dataset)
     config["dataset"] = args.dataset.lower()
     config.setdefault("kernel", "l2")
+    config.setdefault("kernel_normalization", "xy")
+    if args.kernel_normalization is not None:
+        config["kernel_normalization"] = args.kernel_normalization
     if config["kernel"] not in {"l2", "gaussian"}:
         raise ValueError(
             f"Unsupported kernel in config: {config['kernel']}. "
             "Expected one of: l2, gaussian."
+        )
+    if config["kernel_normalization"] not in {"xy", "y"}:
+        raise ValueError(
+            f"Unsupported kernel_normalization in config: {config['kernel_normalization']}. "
+            "Expected one of: xy, y."
         )
     if args.feature_encoder_arch is not None:
         config["feature_encoder_arch"] = args.feature_encoder_arch
@@ -884,6 +895,13 @@ def main():
         type=str,
         default=None,
         help="Optional override for feature encoder architecture.",
+    )
+    parser.add_argument(
+        "--kernel_normalization",
+        type=str,
+        default=None,
+        choices=["xy", "y"],
+        help="Override kernel normalization mode: xy | y.",
     )
     parser.add_argument(
         "--feature_encoder_path",

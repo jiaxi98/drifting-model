@@ -24,6 +24,7 @@ use_feature_encoder: true
 use_full_feature_set: true
 feature_encoder_arch: resnet18
 kernel: l2 # l2 | gaussian
+kernel_normalization: xy # xy | y
 queue_size: 128
 uncond_queue_size: 256
 label_dropout: 0.1

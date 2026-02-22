@@ -29,6 +29,7 @@ defaults:
   lr: null
   warmup_steps: null
   temperatures: null
+  kernel_normalization: null
 
   alpha_min: null
   alpha_max: null

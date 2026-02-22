@@ -16,6 +16,7 @@ def compute_V_from_dists(
     temperature: float,
     mask_self: bool = True,
     neg_weights: Optional[torch.Tensor] = None,
+    normalization: str = "xy",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute drifting field V from precomputed pairwise distances.
@@ -28,6 +29,9 @@ def compute_V_from_dists(
         temperature: Temperature for softmax (smaller = sharper)
         mask_self: Whether to mask self-distances when y_neg starts with x
         neg_weights: Optional non-negative weights for negative samples, shape (N_neg,)
+        normalization: Kernel normalization mode.
+            - "xy": softmax over y and x (paper default in our codebase)
+            - "y": softmax over y only, separately for positive/negative sets
 
     Returns:
         V: Drifting field, shape (N, D)
@@ -49,6 +53,11 @@ def compute_V_from_dists(
             f"y_neg first dimension must match dist_neg second dimension ({N_neg}), "
             f"got {y_neg.shape[0]}."
         )
+    if normalization not in {"xy", "y"}:
+        raise ValueError(
+            f"Unsupported normalization mode: {normalization}. "
+            "Expected one of: xy, y."
+        )
 
     # 1) Optional self-mask on a local view/copy to avoid mutating shared dist matrices.
     if mask_self and N_neg >= N:
@@ -69,21 +78,29 @@ def compute_V_from_dists(
         safe_weights = neg_weights.to(logit_neg.device).clamp_min(1e-12)
         logit_neg = logit_neg + torch.log(safe_weights).unsqueeze(0)
 
-    # 3) Normalize over y-axis and x-axis.
-    logit = torch.cat([logit_pos, logit_neg], dim=1)
-    A_row = torch.softmax(logit, dim=1)
-    A_col = torch.softmax(logit, dim=0)
-    A = torch.sqrt(A_row * A_col)
+    if normalization == "xy":
+        # 3) Normalize over y-axis and x-axis.
+        logit = torch.cat([logit_pos, logit_neg], dim=1)
+        A_row = torch.softmax(logit, dim=1)
+        A_col = torch.softmax(logit, dim=0)
+        A = torch.sqrt(A_row * A_col)
 
-    # 4) Split into positive / negative affinities.
-    A_pos = A[:, :N_pos]
-    A_neg = A[:, N_pos:]
+        # 4) Split into positive / negative affinities.
+        A_pos = A[:, :N_pos]
+        A_neg = A[:, N_pos:]
 
-    # 5) Cross-weighting and drift.
-    W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)
-    W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)
-    drift_pos = torch.mm(W_pos, y_pos)
-    drift_neg = torch.mm(W_neg, y_neg)
+        # 5) Cross-weighting and drift.
+        W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)
+        W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)
+        drift_pos = torch.mm(W_pos, y_pos)
+        drift_neg = torch.mm(W_neg, y_neg)
+    else:
+        # Normalize over sample axis only, separately for positives and negatives.
+        A_pos = torch.softmax(logit_pos, dim=1)
+        A_neg = torch.softmax(logit_neg, dim=1)
+        drift_pos = torch.mm(A_pos, y_pos)
+        drift_neg = torch.mm(A_neg, y_neg)
+
     V = drift_pos - drift_neg
     return V, A_pos, A_neg
 
@@ -95,6 +112,7 @@ def compute_V(
     temperature: float,
     mask_self: bool = True,
     neg_weights: Optional[torch.Tensor] = None,
+    normalization: str = "xy",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the drifting field V (Algorithm 2 from paper, Page 12).
@@ -108,6 +126,7 @@ def compute_V(
         temperature: Temperature for softmax (smaller = sharper)
         mask_self: Whether to mask self-distances (when y_neg includes x in first N entries)
         neg_weights: Optional non-negative weights for negative samples, shape (N_neg,)
+        normalization: Kernel normalization mode ("xy" or "y")
 
     Returns:
         V: Drifting field, shape (N, D)
@@ -122,6 +141,7 @@ def compute_V(
         temperature=temperature,
         mask_self=mask_self,
         neg_weights=neg_weights,
+        normalization=normalization,
     )
 
 
@@ -133,6 +153,7 @@ def compute_V_multi_temperature(
     mask_self: bool = True,
     normalize_each: bool = True,
     neg_weights: Optional[torch.Tensor] = None,
+    normalization: str = "xy",
 ) -> torch.Tensor:
     """
     Compute drifting field with multiple temperatures (Sec A.6).
@@ -148,6 +169,7 @@ def compute_V_multi_temperature(
         mask_self: Whether to mask self-distances
         normalize_each: Whether to normalize each V before summing
         neg_weights: Optional non-negative weights for negative samples, shape (N_neg,)
+        normalization: Kernel normalization mode ("xy" or "y")
 
     Returns:
         V: Combined drifting field, shape (N, D)
@@ -162,6 +184,7 @@ def compute_V_multi_temperature(
             tau,
             mask_self=mask_self,
             neg_weights=neg_weights,
+            normalization=normalization,
         )
 
         if normalize_each:

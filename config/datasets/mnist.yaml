@@ -23,6 +23,7 @@ alpha_power: 3.0
 use_feature_encoder: false
 feature_encoder_arch: resnet18
 kernel: gaussian # l2 | gaussian
+kernel_normalization: xy # xy | y
 queue_size: 64
 uncond_queue_size: 256
 label_dropout: 0.1
