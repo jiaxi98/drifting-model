@@ -23,7 +23,7 @@ pip install torch torchvision einops
 ```
 
 ## TODO
-- [x] Support MNIST and CIFAR-10
+- [x] Support MNIST and CIFAR
 - [ ] Support ImageNet
 
 ## Usage
@@ -34,14 +34,14 @@ pip install torch torchvision einops
 # MNIST (pixel space, ~20 min on GPU)
 python train.py --dataset mnist
 
-# CIFAR-10 (with feature encoder)
-python train.py --dataset cifar10
+# CIFAR (with feature encoder)
+python train.py --dataset cifar
 ```
 
 ### Sampling
 
 ```bash
-python sample.py --checkpoint outputs/mnist/checkpoint_final.pt --dataset mnist
+python eval.py --checkpoint outputs/mnist/checkpoint_final.pt --dataset mnist
 ```
 
 ## Results
@@ -50,9 +50,9 @@ MNIST samples after ~8000 steps:
 
 ![MNIST Samples](assets/samples_step8000.png)
 
-CIFAR-10 samples after ~8500 steps:
+CIFAR samples after ~8500 steps:
 
-![CIFAR-10 Samples](assets/samples_step8500.png)
+![CIFAR Samples](assets/samples_step8500.png)
 
 ## Project Structure
 
@@ -61,18 +61,16 @@ CIFAR-10 samples after ~8500 steps:
 ├── drifting.py         # Drifting field V computation
 ├── feature_encoder.py  # CNN feature encoder (for CIFAR)
 ├── train.py            # Training loop
-├── sample.py           # Sampling script
+├── eval.py             # Sampling/evaluation script
 └── utils.py            # EMA, utilities
 ```
 
 ## Key Hyperparameters
 
-| Parameter | MNIST | CIFAR-10 |
+| Parameter | MNIST | CIFAR |
 |-----------|-------|----------|
 | Model | DriftDiT-Tiny (9M) | DriftDiT-Small (27M) |
 | Epochs | 100 | 200 |
 | LR | 2e-4 | 2e-4 |
 | Temperatures | [0.02, 0.05, 0.2] | [0.02, 0.05, 0.2] |
 | Feature space | Pixel (L2 norm) | CNN encoder |
-
-

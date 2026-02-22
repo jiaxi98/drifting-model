@@ -2,7 +2,7 @@
 Drifting Models Implementation
 
 A PyTorch reproduction of "Generative Modeling via Drifting" (Deng et al., 2026)
-for MNIST and CIFAR-10 datasets.
+for MNIST and CIFAR datasets.
 """
 
 from .model import (

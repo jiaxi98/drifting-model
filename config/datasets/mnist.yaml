@@ -3,8 +3,8 @@ img_size: 32
 in_channels: 1
 num_classes: 10
 batch_nc: 10
-batch_n_pos: 256
-batch_n_neg: 256
+batch_n_pos: 64
+batch_n_neg: 64
 batch_n_uncond: 0
 temperatures:
   - 0.02
@@ -15,7 +15,7 @@ weight_decay: 0.01
 grad_clip: 2.0
 ema_decay: 0.999
 warmup_steps: 1000
-epochs: 100
+epochs: 500
 alpha_min: 1.0
 alpha_max: 3.0
 alpha_sampling: uniform
@@ -23,7 +23,7 @@ alpha_power: 3.0
 use_feature_encoder: false
 feature_encoder_arch: resnet18
 kernel: gaussian # l2 | gaussian
-queue_size: 32
+queue_size: 64
 uncond_queue_size: 256
 label_dropout: 0.1
 loader_batch_size: 256

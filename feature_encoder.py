@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Tuple
+from pathlib import Path
 import torchvision.models as models
 
 
@@ -117,6 +118,112 @@ class PretrainedConvNeXtV2Encoder(nn.Module):
             raise RuntimeError("ConvNeXt-V2 encoder did not return multi-scale hidden states.")
         # hidden_states[0] is patch embedding output; use 4 stage features.
         return hidden_states[1:]
+
+
+class PretrainedDINOv2MultiResEncoder(nn.Module):
+    """
+    Frozen DINOv2 ViT-B/14 encoder with multi-resolution intermediate feature maps.
+
+    Returns selected intermediate layers as feature maps with shape (B, C, H, W),
+    compatible with extract_feature_sets/extract_feature_fullsets.
+    """
+
+    def __init__(
+        self,
+        repo_or_dir: str = "facebookresearch/dinov2",
+        model_name: str = "dinov2_vitb14",
+        input_size: int = 112,
+        layer_indices: Tuple[int, ...] = (2, 5, 8, 11),
+    ):
+        super().__init__()
+        self.expected_in_channels = 3
+        self.input_size = int(input_size)
+        self.layer_indices = list(layer_indices)
+
+        source = "github"
+        resolved_repo = repo_or_dir
+        if repo_or_dir and Path(repo_or_dir).exists():
+            source = "local"
+            resolved_repo = str(Path(repo_or_dir))
+
+        self.backbone = torch.hub.load(resolved_repo, model_name, source=source)
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x + 1.0) * 0.5
+        x = x.clamp(0.0, 1.0)
+        return (x - self.pixel_mean) / self.pixel_std
+
+    @staticmethod
+    def _tokens_to_feature_map(tokens: torch.Tensor) -> torch.Tensor:
+        # Accept either [B, HW, C] or [B, 1+HW, C] and reshape to [B, C, H, W].
+        if tokens.dim() != 3:
+            raise RuntimeError(f"Expected token tensor with shape (B, T, C), got {tuple(tokens.shape)}.")
+        bsz, num_tokens, channels = tokens.shape
+
+        side = int(num_tokens ** 0.5)
+        if side * side == num_tokens:
+            spatial_tokens = tokens
+        elif num_tokens > 1:
+            side_cls = int((num_tokens - 1) ** 0.5)
+            if side_cls * side_cls == (num_tokens - 1):
+                spatial_tokens = tokens[:, 1:, :]
+                side = side_cls
+            else:
+                raise RuntimeError(
+                    f"Cannot infer spatial map from token count={num_tokens}."
+                )
+        else:
+            raise RuntimeError(
+                f"Cannot infer spatial map from token count={num_tokens}."
+            )
+
+        return spatial_tokens.transpose(1, 2).reshape(bsz, channels, side, side)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        x = self._normalize(x)
+        x = F.interpolate(
+            x,
+            size=(self.input_size, self.input_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        features = self.backbone.get_intermediate_layers(
+            x,
+            n=self.layer_indices,
+            reshape=True,
+        )
+
+        if isinstance(features, torch.Tensor):
+            features = [features]
+
+        feature_maps: List[torch.Tensor] = []
+        for feat in features:
+            if isinstance(feat, (tuple, list)):
+                feat = feat[0]
+            if feat.dim() == 3:
+                feat = self._tokens_to_feature_map(feat)
+            if feat.dim() != 4:
+                raise RuntimeError(
+                    "DINOv2 intermediate feature must be 4D map or 3D tokens, "
+                    f"got shape {tuple(feat.shape)}."
+                )
+            feature_maps.append(feat)
+        return feature_maps
 
 
 class BasicBlock(nn.Module):
@@ -557,7 +664,7 @@ def create_feature_encoder(
         multi_scale: Whether to use multi-scale features
         use_pretrained: Whether to use ImageNet-pretrained ResNet
         pretrained_arch: Backbone arch for pretrained encoder.
-            Supported values: "resnet18", "resnet50", "convnextv2-large"
+            Supported values: "resnet18", "resnet50", "convnextv2-large", "dinov2-multires"
         pretrained_path: Optional local/remote checkpoint path for pretrained encoder
 
     Returns:
@@ -573,6 +680,14 @@ def create_feature_encoder(
             return PretrainedConvNeXtV2Encoder(
                 pretrained_name_or_path=model_name_or_path,
                 local_files_only=bool(pretrained_path),
+            )
+        if arch in {"dinov2", "dinov2-multires", "dinov2-vitb14", "dinov2_vitb14"}:
+            repo_or_dir = pretrained_path or "facebookresearch/dinov2"
+            return PretrainedDINOv2MultiResEncoder(
+                repo_or_dir=repo_or_dir,
+                model_name="dinov2_vitb14",
+                input_size=112,
+                layer_indices=(2, 5, 8, 11),
             )
         raise ValueError(f"Unsupported pretrained encoder arch: {pretrained_arch}")
 
