@@ -120,21 +120,32 @@ Observations:
 ## Feature extractor
 We believe feature quality is a key factor for drift-model performance. Current reproduction quality is not enough yet; feature extractor choices and alignment with paper settings remain a major open factor.
 
-## Planned next experiments
-To better explain the current quality gap, we will run the following three targeted ablations next.
+## Kernel normalization ablation (xy vs y)
+We completed the first normalization ablation on MNIST.
 
-### 1) Kernel normalization ablation (highest priority)
-Motivation: the paper (Table 11) studies kernel normalization variants, while our current implementation uses softmax over both `x` and `y` axes by default.
+Setup:
+- Dataset/config: MNIST, `batch_n_pos=batch_n_neg=32`, Gaussian kernel
+- Hardware: 8-GPU DDP (`world_size=8`)
+- Budget: `epochs=200`, `log_interval=1`, `wandb_fid_interval=10`
+- W&B runs:
+  - `xy`: `dibo5cz0` (`mnist_knorm_xy_bs32_ep200_all8_20260222_094511`)
+  - `y`: `crfq8atl` (`mnist_knorm_y_bs32_ep200_all8_20260222_094511`)
 
-Plan:
-- Implement a `y-only` normalization path in `compute_V_from_dists` (normalize only across `y_pos` / `y_neg` samples per generated sample).
-- Compare three variants under the same training budget:
-  - `x+y` softmax (current default)
-  - `y-only` softmax (closer to the original kernel weighting form)
-  - no normalization
-- Report `train/loss`, FID, IS, and final sample grids.
+| setting | final step | min train/loss | last train/loss | min FID | last FID | max IS | last IS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `xy` normalization | 5800 | 3.9222 | 6.6500 | 82.4467 | 83.0003 | 2.7533 | 2.4640 |
+| `y` normalization | 5800 | 7.1278 | 7.2162 | 79.7360 | 79.7360 | 2.7981 | 2.4059 |
 
-### 2) Feature encoder family ablation
+Observations:
+- `y` normalization improves FID versus `xy` in this 200-epoch setting (final: `83.00 -> 79.74`).
+- `train/loss` scale is very different between the two normalization modes; loss is not directly comparable as a quality proxy.
+- Final IS is slightly lower for `y` (`2.4059`) than `xy` (`2.4640`), although `y` has a higher peak IS.
+- Both runs are still much worse than our earlier long-run MNIST Gaussian baseline (`min FID=40.693` at `bs32`), indicating this budget/setup is not enough for strong convergence.
+
+## Remaining planned experiments
+To better explain the current quality gap, we will run the following two targeted ablations next.
+
+### 1) Feature encoder family ablation
 Motivation: Table 3 and Appendix A.4 indicate feature encoder quality strongly affects final FID.
 
 Plan:
@@ -146,7 +157,7 @@ Plan:
 - Track convergence speed, FID/IS trajectory, and final quality.
 - Highlight mismatch vs paper settings (paper uses stronger SSL encoders, including MAE-based encoders).
 
-### 3) Feature-space vs pixel-space ablation
+### 2) Feature-space vs pixel-space ablation
 Motivation: this may be a major source of the gap to paper-level quality.
 
 Plan:
@@ -156,7 +167,7 @@ Plan:
 - Keep model, optimizer, and sampling/eval budget fixed.
 - Compare loss behavior, FID/IS, and visual quality at matched steps.
 
-### Shared protocol for the three ablations
+### Shared protocol for the remaining ablations
 - Fix dataset split, training steps, eval cadence, and `fid_num_samples`.
 - Use the same logging keys and save sample grids at matched steps.
 - Prefer at least 2 seeds if compute budget allows; otherwise clearly label single-seed conclusions as preliminary.
